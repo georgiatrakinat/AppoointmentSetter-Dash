@@ -27,10 +27,22 @@ import {
 // ---- PROD seams ----------------------------------------------------------
 const ELIGIBILITY_HOURS = 1;           // give the field rep first crack
 const CLAIM_HOURS = 24;
-const CRM_RECORD_URL = (leadId) => `https://crm.lifesource.example/lead/${leadId}`; // PROD: real pattern
-const LOST_STATUS_IDS = [];            // PROD: confirm lost status_id(s)
-const isSLead = (_r) => false;         // PROD: identify sLeads
-const isCommercial = (_r) => false;    // PROD: identify commercial leads
+
+// Live feed — same endpoint the SalesRep dash uses.
+const API_BASE = "https://repsdashboard-azchfecngygafmep.southcentralus-01.azurewebsites.net/api/untouched-leads/";
+const API_CODE = "aNdpydlNtfuOpFLB2Ab1oDjrTg6SVJOMfIg5ErWelULJAzFu3ZqX4Q==";
+const feedUrl = () => API_BASE + "?code=" + encodeURIComponent(API_CODE);
+
+// Real CRM deep-link (matches SalesRep dash).
+const CRM_RECORD_URL = (leadId) =>
+  `https://www.mylifesourcewater.com/webcrm/expandedleads.php?leads_id=${leadId}`;
+
+// Lost-sale detection from comment text — mirrors the SalesRep dash LOST_RE.
+const LOST_RE = /(do\s*-?\s*not\s*sell|don'?t\s*sell|unable to install\s+(?:our\s+|the\s+|whole[-\s]?house\s+)?(?:system|whole[-\s]?house))/i;
+const LOST_EXCLUDE_RE = /unable to install\s+(?:until|next|on|by|this|in|the week)/i;
+
+const isSLead = (_r) => false;         // PROD: identify sLeads (field/marker still TBD)
+const isCommercial = (_r) => false;    // PROD: commercial field name still unconfirmed in feed
 const BRANCH_BY_REP = {                // PROD: real roster
   "Richard Foronda": "Pasadena",
   "Diego Soc Domingo": "Pasadena",
@@ -95,7 +107,9 @@ function deriveMilestone(r) {
 }
 const team = (r) => (/national sales/i.test(r.salesreps_name || "") ? "NST" : "Field");
 const apptBooked = (r) => isVal(r["Set Appt"]) || isVal(r["Appt. Completed"]) || isVal(r["CDR Appt. Done"]);
-const isLost = (r) => LOST_STATUS_IDS.includes(r.status_id) || /lost/i.test(r.status || "");
+const isLost = (r) =>
+  (LOST_RE.test(r.comments || "") && !LOST_EXCLUDE_RE.test(r.comments || "")) ||
+  /lost/i.test(r.status || "");
 const isResidential = (r) => String(r.professional).toLowerCase() !== "true" && !isCommercial(r);
 
 function enrich(r, now) {
@@ -157,7 +171,41 @@ export default function AppointmentSetterBoard() {
   const [sort, setSort] = useState("newest");
   const [page, setPage] = useState(0);
   const [hover, setHover] = useState(null); // {rec, x, y}
+  const [records, setRecords] = useState(null); // raw feed (null=loading)
+  const [loadState, setLoadState] = useState("loading"); // loading | ready | error
+  const [loadErr, setLoadErr] = useState("");
   const PAGE = 12;
+
+  // Live data load — mirrors the SalesRep dash: client-side fetch, NaN-tolerant
+  // parse, dedup by leads_id. Set USE_LIVE=false to fall back to embedded SEED.
+  const USE_LIVE = true;
+  async function loadLiveData() {
+    if (!USE_LIVE) { setRecords(SEED); setLoadState("ready"); return; }
+    setLoadState("loading"); setLoadErr("");
+    try {
+      const resp = await fetch(feedUrl(), { method: "GET" });
+      if (!resp.ok) throw new Error(`CRM feed returned HTTP ${resp.status}.`);
+      const text = await resp.text();
+      // Python json can emit NaN/Infinity (invalid JSON) — sanitize before parse.
+      const clean = text.replace(/\bNaN\b/g, "null").replace(/-?\bInfinity\b/g, "null");
+      const parsed = JSON.parse(clean);
+      const arr = Array.isArray(parsed)
+        ? parsed
+        : parsed?.data || parsed?.records || parsed?.results || [];
+      // Dedup by leads_id, keeping the richest (longest comments) copy.
+      const byId = new Map();
+      for (const r of arr) {
+        const ex = byId.get(r.leads_id);
+        if (!ex || (r.comments || "").length > (ex.comments || "").length) byId.set(r.leads_id, r);
+      }
+      setRecords([...byId.values()]);
+      setLoadState("ready");
+    } catch (e) {
+      setLoadErr(String(e.message || e));
+      setLoadState("error");
+    }
+  }
+  useEffect(() => { loadLiveData(); }, []);
 
   useEffect(() => {
     const t = setInterval(() => setNow(Date.now()), 30000);
@@ -181,7 +229,7 @@ export default function AppointmentSetterBoard() {
 
   // enrich + eligibility filter
   const eligible = useMemo(() => {
-    return SEED.map((r) => enrich(r, now)).filter((r) => {
+    return (records || []).map((r) => enrich(r, now)).filter((r) => {
       if (!isResidential(r)) return false;        // residential only
       if (isSLead(r)) return false;               // drop sLeads
       if (isLost(r)) return false;                // drop lost
@@ -189,7 +237,7 @@ export default function AppointmentSetterBoard() {
       if (now - r.firstMs < ELIGIBILITY_HOURS * 3.6e6) return false; // field rep's first hour
       return true;
     });
-  }, [now]);
+  }, [records, now]);
 
   const counts = useMemo(() => {
     const c = { nocontact: 0, attempted: 0, contacted: 0, mine: 0 };
@@ -241,7 +289,9 @@ export default function AppointmentSetterBoard() {
           </div>
         </div>
         <div className="asb-head-right">
-          <button className="asb-ghost" title="Refresh (live feed in production)"><RefreshCw size={14} /> Refresh</button>
+          <button className="asb-ghost" onClick={loadLiveData} title="Re-pull from the live CRM feed">
+            <RefreshCw size={14} /> Refresh
+          </button>
           <div className="asb-user">
             <User size={14} />
             <select value={userId} onChange={(e) => setUserId(e.target.value)}>
@@ -251,6 +301,27 @@ export default function AppointmentSetterBoard() {
         </div>
       </header>
 
+      {loadState === "loading" && (
+        <div className="asb-status">
+          <span className="asb-spin" />
+          <p>Pulling live leads from the CRM…</p>
+        </div>
+      )}
+
+      {loadState === "error" && (
+        <div className="asb-status asb-status-err">
+          <p className="asb-err-title">Couldn't load the live feed</p>
+          <p className="asb-err-detail">{loadErr}</p>
+          <p className="asb-err-hint">
+            If this says "Failed to fetch," the CRM feed is likely blocking this app's
+            address. Add this site's URL to the feed's CORS allowed origins, then retry.
+          </p>
+          <button className="asb-claim" onClick={loadLiveData}><RefreshCw size={13} /> Retry</button>
+        </div>
+      )}
+
+      {loadState === "ready" && (
+      <>
       {/* Controls */}
       <div className="asb-controls">
         <div className="asb-search">
@@ -361,6 +432,8 @@ export default function AppointmentSetterBoard() {
           <button disabled={page >= pages - 1} onClick={() => setPage((p) => p + 1)}><ChevronRight size={14} /></button>
         </div>
       </div>
+      </>
+      )}
 
       {/* Comment hover panel */}
       {hover && (
@@ -497,6 +570,14 @@ const CSS = `
 .asb-pop-ts{color:var(--muted);font-size:10px;}
 .asb-pop-who{color:var(--indigo);font-weight:560;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
 .asb-pop-text{color:var(--ink);}
+
+.asb-status{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:14px;padding:80px 24px;text-align:center;color:var(--muted);}
+.asb-spin{width:34px;height:34px;border:3px solid var(--line);border-top-color:var(--indigo);border-radius:50%;animation:asb-spin .8s linear infinite;}
+@keyframes asb-spin{to{transform:rotate(360deg);}}
+.asb-status-err{color:var(--ink);max-width:520px;margin:40px auto;background:#fff;border:1px solid var(--line);border-radius:12px;}
+.asb-err-title{font-weight:680;font-size:15px;color:var(--red);margin:0;}
+.asb-err-detail{font-family:ui-monospace,Menlo,monospace;font-size:12px;color:var(--slate);background:#f5f7fa;border-radius:7px;padding:8px 10px;margin:0;}
+.asb-err-hint{font-size:12px;color:var(--muted);margin:0;line-height:1.5;}
 
 @media (max-width:1100px){
   .asb-tr{grid-template-columns:110px 1.2fr 1fr 70px 80px 1.6fr 78px;}
