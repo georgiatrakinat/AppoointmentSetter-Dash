@@ -37,32 +37,106 @@ const feedUrl = () => API_BASE + "?code=" + encodeURIComponent(API_CODE);
 const CRM_RECORD_URL = (leadId) =>
   `https://www.mylifesourcewater.com/webcrm/expandedleads.php?leads_id=${leadId}`;
 
-// Lost-sale detection from comment text — mirrors the SalesRep dash LOST_RE.
-const LOST_RE = /(do\s*-?\s*not\s*sell|don'?t\s*sell|unable to install\s+(?:our\s+|the\s+|whole[-\s]?house\s+)?(?:system|whole[-\s]?house))/i;
-const LOST_EXCLUDE_RE = /unable to install\s+(?:until|next|on|by|this|in|the week)/i;
+// Lost-sale detection — ported verbatim from the SalesRep dash (LOST_RE + status 6).
+const LOST_RE = /\blost\s+sale\b|\bmark(?:ing|ed)?\s+(?:as\s+)?lost\b|\blost\s+to\s+\w+|\bnot\s+closable\b|\bdead\s+lead\b|\blost\s+cause\b|\bclosed\s+lost\b|\bdo[\s-]+not[\s-]+sell\b|\bdon['’]?t\s+sell\b|\bunable\s+to\s+install\b[\s\w-]{0,40}?\bsystem\b/i;
+// EM Duggan partner channel — excluded from the pool (matches SalesRep POOL_EXCLUDE_RE).
+const POOL_EXCLUDE_RE = /\be\.?\s*m\.?\s*duggan\b/i;
 
-const isSLead = (r) =>
-  SLEAD_ACCOUNT_TYPES.includes(String(r.account_type || "").trim().toLowerCase());
+// sLeads are tagged in account_type, e.g. "sLead / Relead". Match the sLead token.
+const isSLead = (r) => /\bs[-\s]?lead/i.test(String(r.account_type || ""));
 const isCommercial = (_r) => false;    // PROD: commercial field name still unconfirmed in feed
 
-// Fill these once the admin diagnostic panel shows the real values.
-const SLEAD_ACCOUNT_TYPES = [];        // e.g. ["slead"] — account_type value(s) that mark an sLead
-const EXCLUDED_ACCOUNT_CLASSES = [];   // e.g. ["secondary"] — account_class value(s) to drop
-const BRANCH_BY_REP = {                // PROD: real roster
-  "Richard Foronda": "Pasadena",
-  "Diego Soc Domingo": "Pasadena",
-  "Dale Marcouillier": "Phoenix",
-  "Chad Jones": "Pasadena",
-  "Rich Simonton": "Phoenix",
-  "Travis Hudson - National Sales": "National",
+// Drop prospects + already-paid customers (residential leads only). relead handled separately.
+const EXCLUDED_ACCOUNT_CLASSES = ["prospect", "customer"];
+
+// Roster from the May 2026 census, keyed by lastname|first-initial so feed nicknames
+// (Rich→Richard, Sam→Samuel, Dan→Daniel…) resolve. NST reps have no branch.
+function repKey(name) {
+  const n = String(name || "").replace(/\s*-\s*National Sales\s*$/i, "").trim().toLowerCase();
+  const p = n.split(/\s+/).filter(Boolean);
+  return p.length < 2 ? n : `${p[p.length - 1]}|${p[0][0]}`;
+}
+const ROSTER = {
+  "bartow|s": { b: null, t: "NST" }, "bergam|n": { b: "Texas", t: "Field" },
+  "brar|g": { b: null, t: "NST" }, "brownell|b": { b: "Arizona", t: "Field" },
+  "brown|d": { b: "Fresno", t: "Field" }, "butler|k": { b: "San Clemente", t: "Field" },
+  "camba|r": { b: null, t: "NST" }, "chamberlin|c": { b: "Las Vegas", t: "Field" },
+  "colosi|n": { b: "Las Vegas", t: "Field" }, "coria|p": { b: "Arizona", t: "Field" },
+  "crabb|c": { b: "San Diego", t: "Field" }, "delgado|f": { b: null, t: "NST" },
+  "donella|c": { b: "Pasadena", t: "Field" }, "fithian|j": { b: "Pasadena", t: "Field" },
+  "foronda|r": { b: null, t: "NST" }, "gaillard|a": { b: "San Jose", t: "Field" },
+  "garcia-cano|f": { b: "Inland Empire", t: "Field" }, "gumbinger|s": { b: "Sacramento", t: "Field" },
+  "halderman|j": { b: null, t: "NST" }, "hess|c": { b: "Inland Empire", t: "Field" },
+  "hillard|d": { b: "Pasadena", t: "Field" }, "hudson|t": { b: null, t: "NST" },
+  "jaramillo|l": { b: "San Clemente", t: "Field" }, "karapetian|v": { b: "Pasadena", t: "Field" },
+  "kaye|j": { b: "Ventura", t: "Field" }, "kelly|d": { b: "Inland Empire", t: "Field" },
+  "kirkendoll|m": { b: "San Clemente", t: "Field" }, "lewis|s": { b: "Ventura", t: "Field" },
+  "liechty|e": { b: "San Jose", t: "Field" }, "marcouillier|d": { b: "Arizona", t: "Field" },
+  "marcouillier|k": { b: "San Jose", t: "Field" }, "mclean|c": { b: "Central Coast", t: "Field" },
+  "mullen|k": { b: "Inland Empire", t: "Field" }, "munoz|g": { b: "San Clemente", t: "Field" },
+  "nam|m": { b: null, t: "NST" }, "nelson|m": { b: "San Diego", t: "Field" },
+  "nielsen|s": { b: "San Diego", t: "Field" }, "pease|b": { b: "Sacramento", t: "Field" },
+  "pickering|j": { b: "Texas", t: "Field" }, "rabelas|n": { b: "San Jose", t: "Field" },
+  "rankin|a": { b: "Sacramento", t: "Field" }, "renner|w": { b: "San Jose", t: "Field" },
+  "rignack|r": { b: "Pasadena", t: "Field" }, "robinson|s": { b: "San Clemente", t: "Field" },
+  "ross|d": { b: "Arizona", t: "Field" }, "ruddell|g": { b: "Pasadena", t: "Field" },
+  "sabor|d": { b: "Arizona", t: "Field" }, "sagen|j": { b: "Pasadena", t: "Field" },
+  "segovia|b": { b: "San Jose", t: "Field" }, "simonton|r": { b: "San Jose", t: "Field" },
+  "soares|c": { b: "Central Coast", t: "Field" }, "sorbello|r": { b: "San Jose", t: "Field" },
+  "ton|a": { b: "Inland Empire", t: "Field" }, "travis|d": { b: "Inland Empire", t: "Field" },
+  "wafford|m": { b: "Arizona", t: "Field" }, "watts|j": { b: "Texas", t: "Field" },
+  "willette|z": { b: "Las Vegas", t: "Field" },
 };
 
-// ---- Prototype users (PROD: Entra SSO identity) --------------------------
-const USERS = [
-  { id: "u1", name: "Nora Avanesian", initials: "NA", role: "setter" },
-  { id: "u2", name: "Daniel Cerrato", initials: "DC", role: "setter" },
-  { id: "u3", name: "Georgia Harris", initials: "GH", role: "admin" },
-];
+// ---- Access control (Entra SSO identity, matched by email) ---------------
+// Appointment setters can claim; admins see/manage everything. Keys are lowercase emails.
+const ACCESS_MAP = {
+  // Appointments team — can claim & appear on the opp
+  "alexandra@lifesourcewater.com": { name: "Alexandra Williams", initials: "AW", role: "setter" },
+  "fabio@lifesourcewater.com": { name: "Fabio Davila", initials: "FD", role: "setter" },
+  "lisa@lifesourcewater.com": { name: "Lisa Porras", initials: "LP", role: "setter" },
+  "jsequera@lifesourcewater.com": { name: "Juan Sequera", initials: "JS", role: "setter" },
+  "alexi@lifesourcewater.com": { name: "Alexi Martin", initials: "AM", role: "setter" },
+  "diego@lifesourcewater.com": { name: "Diego Soc Domingo", initials: "DD", role: "setter" },
+  "dcerrato@lifesourcewater.com": { name: "Daniel Cerrato", initials: "DC", role: "setter" },
+  "amunoz@lifesourcewater.com": { name: "Angelo Granada", initials: "AG", role: "setter" },
+  // Admins — see everything, release/extend any claim
+  "georgia@lifesourcewater.com": { name: "Georgia Harris", initials: "GH", role: "admin" },
+  "bryan@lifesourcewater.com": { name: "Bryan Harris", initials: "BH", role: "admin" },
+  "nora@lifesourcewater.com": { name: "Nora Avanesian", initials: "NA", role: "admin" },
+  "mark@lifesourcewater.com": { name: "Mark Harris", initials: "MH", role: "admin" },
+};
+
+// SSO identity resolution — ported from the SalesRep dash (handles B2B guest UPNs).
+async function fetchUserIdentity() {
+  try {
+    const resp = await fetch("/.auth/me");
+    if (!resp.ok) return null;
+    const payload = await resp.json();
+    const cp = payload && payload.clientPrincipal;
+    return cp ? identityEmailFromPrincipal(cp) : null;
+  } catch {
+    return null; // /.auth/me absent (e.g. local preview) → caller falls back to dev picker
+  }
+}
+function identityEmailFromPrincipal(cp) {
+  const looksEmail = (s) => typeof s === "string" && !s.includes("#") && /^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(s);
+  const deExt = (s) => {
+    if (typeof s !== "string") return s;
+    const m = s.match(/^(.+)#EXT#@/i);
+    return m ? m[1].replace(/_([^_]+)$/, "@$1") : s;
+  };
+  const candidates = [];
+  if (cp.userDetails) { candidates.push(cp.userDetails); candidates.push(deExt(cp.userDetails)); }
+  (Array.isArray(cp.claims) ? cp.claims : []).forEach((c) => {
+    const typ = String(c.typ || c.type || "").toLowerCase();
+    const val = c.val || c.value;
+    if (val && (typ.includes("email") || typ.includes("preferred_username") || typ.endsWith("/upn") || typ === "upn")) {
+      candidates.push(val); candidates.push(deExt(val));
+    }
+  });
+  return candidates.find(looksEmail) || (cp.userDetails || null);
+}
 
 // ---- Seed: faithful transcription of the pasted sample -------------------
 const SEED = [
@@ -90,11 +164,15 @@ function parseComments(str) {
   });
   const touches = lines.filter((l) => /Dialed Contact:|Emailed Contact:/i.test(l.text)).length;
   const contacted = lines.some((l) => /Dialed Contact:\s*Contacted/i.test(l.text));
+  const attemptLines = lines.filter((l) => l.who && /Dialed Contact:|Emailed Contact:/i.test(l.text));
+  const lastAttempt = attemptLines.length ? attemptLines[attemptLines.length - 1] : null;
   const tsList = lines.map((l) => l.ts).filter(Boolean).sort();
   return {
     lines,
     touches,
     contacted,
+    lastAttemptBy: lastAttempt ? lastAttempt.who : null,
+    lastAttemptTs: lastAttempt ? lastAttempt.ts : null,
     lastLine: lines[lines.length - 1] || null,
     lastTs: tsList.length ? tsList[tsList.length - 1] : null,
     firstTs: tsList.length ? tsList[0] : null,
@@ -110,11 +188,9 @@ function deriveMilestone(r) {
   if (isVal(r.Dialed)) return "Dialed";
   return "New";
 }
-const team = (r) => (/national sales/i.test(r.salesreps_name || "") ? "NST" : "Field");
 const apptBooked = (r) => isVal(r["Set Appt"]) || isVal(r["Appt. Completed"]) || isVal(r["CDR Appt. Done"]);
 const isLost = (r) =>
-  (LOST_RE.test(r.comments || "") && !LOST_EXCLUDE_RE.test(r.comments || "")) ||
-  /lost/i.test(r.status || "");
+  r.status_id === 6 || /lost\s*sale/i.test(r.status || "") || LOST_RE.test(r.comments || "");
 const isResidential = (r) => String(r.professional).toLowerCase() !== "true" && !isCommercial(r);
 
 function enrich(r, now) {
@@ -130,19 +206,27 @@ function enrich(r, now) {
   let category = "nocontact";
   if (contacted) category = "contacted";
   else if (p.touches > 0) category = "attempted";
+  // Roster lookup drives team + branch (name suffix alone is unreliable; see Richard Foronda).
+  const ro = ROSTER[repKey(r.salesreps_name)];
+  const teamVal = ro ? ro.t : (/national sales/i.test(r.salesreps_name || "") ? "NST" : "Field");
+  const branch = teamVal === "NST" ? "National" : (ro ? ro.b : "—");
+  const ageBucket = now - leadInMs < ELIGIBILITY_HOURS * 3.6e6 ? "fresh" : "aged";
   return {
     ...r,
     repName,
-    branch: BRANCH_BY_REP[r.salesreps_name] || BRANCH_BY_REP[repName] || "—",
-    team: team(r),
+    branch,
+    team: teamVal,
     milestone: deriveMilestone(r),
     touches: p.touches,
     contacted,
+    lastAttemptBy: p.lastAttemptBy,
+    lastAttemptTs: p.lastAttemptTs,
     lines: p.lines,
     lastLine: p.lastLine,
     lastTouchMs,
     firstMs,
     leadInMs,
+    ageBucket,
     hoursSinceTouch: lastTouchMs ? (now - lastTouchMs) / 3.6e6 : null,
     category,
   };
@@ -207,19 +291,41 @@ function FieldDiag({ records }) {
 
 export default function AppointmentSetterBoard() {
   const [now, setNow] = useState(Date.now());
-  const [userId, setUserId] = useState("u1");
+  const [me, setMe] = useState(null); // {email, name, initials, role}
+  const [access, setAccess] = useState("resolving"); // resolving | ok | blocked | devpick
+  const [signedEmail, setSignedEmail] = useState("");
   const [claims, setClaims] = useState({}); // PROD: loadClaims() from shared store
   const [tab, setTab] = useState("nocontact");
   const [q, setQ] = useState("");
   const [teamF, setTeamF] = useState("all");
   const [branchF, setBranchF] = useState("all");
   const [sort, setSort] = useState("newest");
+  const [ageSeg, setAgeSeg] = useState("aged"); // aged (>1h) | fresh (<1h)
   const [page, setPage] = useState(0);
   const [hover, setHover] = useState(null); // {rec, x, y}
   const [records, setRecords] = useState(null); // raw feed (null=loading)
   const [loadState, setLoadState] = useState("loading"); // loading | ready | error
   const [loadErr, setLoadErr] = useState("");
   const PAGE = 12;
+
+  // Resolve who is signed in (Entra SSO). Roster → setter/admin; any other
+  // LifeSource email → view-only; non-LifeSource → blocked. No SSO (preview) → dev picker.
+  useEffect(() => {
+    (async () => {
+      const email = await fetchUserIdentity();
+      if (!email) { setAccess("devpick"); return; } // local/preview, no /.auth/me
+      const lc = email.toLowerCase();
+      setSignedEmail(lc);
+      const entry = ACCESS_MAP[lc];
+      if (entry) { setMe({ email: lc, ...entry }); setAccess("ok"); }
+      else if (lc.endsWith("@lifesourcewater.com")) {
+        const local = lc.split("@")[0];
+        setMe({ email: lc, name: local, initials: local.slice(0, 2).toUpperCase(), role: "viewer" });
+        setAccess("ok");
+      } else setAccess("blocked");
+    })();
+  }, []);
+  const isAdmin = me?.role === "admin";
 
   // Live data load — mirrors the SalesRep dash: client-side fetch, NaN-tolerant
   // parse, dedup by leads_id. Set USE_LIVE=false to fall back to embedded SEED.
@@ -250,24 +356,24 @@ export default function AppointmentSetterBoard() {
       setLoadState("error");
     }
   }
-  useEffect(() => { loadLiveData(); }, []);
+  useEffect(() => { if (access === "ok" || access === "devpick") loadLiveData(); }, [access]);
 
   useEffect(() => {
     const t = setInterval(() => setNow(Date.now()), 30000);
     return () => clearInterval(t);
   }, []);
 
-  const me = USERS.find((u) => u.id === userId);
-  const isAdmin = me?.role === "admin";
-
   const claimOf = (id) => {
     const c = claims[id];
     if (!c || c.expiresAt <= now) return null; // expired = auto-released
     return c;
   };
-  const saveClaim = (id, claim) => setClaims((p) => ({ ...p, [id]: claim })); // PROD: POST to store
-  const doClaim = (id) =>
-    saveClaim(id, { by: me.id, byName: me.name, initials: me.initials, at: now, expiresAt: now + CLAIM_HOURS * 3.6e6 });
+  const canClaim = me && (me.role === "setter" || me.role === "admin");
+  const saveClaim = (id, claim) => setClaims((p) => ({ ...p, [id]: claim })); // PROD: POST to shared store
+  const doClaim = (id) => {
+    if (!canClaim) return;
+    saveClaim(id, { by: me.email, byName: me.name, initials: me.initials, at: now, expiresAt: now + CLAIM_HOURS * 3.6e6 });
+  };
   const doRelease = (id) => setClaims((p) => { const n = { ...p }; delete n[id]; return n; });
   const doExtend = (id) =>
     setClaims((p) => ({ ...p, [id]: { ...p[id], expiresAt: now + CLAIM_HOURS * 3.6e6 } }));
@@ -277,19 +383,27 @@ export default function AppointmentSetterBoard() {
     return (records || []).map((r) => enrich(r, now)).filter((r) => {
       if (!isResidential(r)) return false;        // residential only
       if (isSLead(r)) return false;               // drop sLeads
+      if (String(r.relead || "").trim().toLowerCase() === "y") return false; // drop releads
       if (isLost(r)) return false;                // drop lost
       if (apptBooked(r)) return false;            // drop already-booked
-      if (EXCLUDED_ACCOUNT_CLASSES.includes(String(r.account_class || "").trim().toLowerCase())) return false;
-      if (now - r.leadInMs < ELIGIBILITY_HOURS * 3.6e6) return false; // field rep's first hour
-      return true;
+      if (POOL_EXCLUDE_RE.test(r.salesreps_name || "")) return false; // drop EM Duggan
+      if (EXCLUDED_ACCOUNT_CLASSES.includes(String(r.account_class || "").trim().toLowerCase())) return false; // drop prospects/customers
+      return true;                                // fresh (<1h) kept; segmented in the UI
     });
   }, [records, now]);
 
+  const ageTotals = useMemo(() => {
+    const t = { fresh: 0, aged: 0 };
+    eligible.forEach((r) => { t[r.ageBucket]++; });
+    return t;
+  }, [eligible]);
+  const segEligible = useMemo(() => eligible.filter((r) => r.ageBucket === ageSeg), [eligible, ageSeg]);
+
   const counts = useMemo(() => {
     const c = { nocontact: 0, attempted: 0, contacted: 0, mine: 0 };
-    eligible.forEach((r) => { c[r.category]++; if (claimOf(r.leads_id)?.by === me.id) c.mine++; });
+    segEligible.forEach((r) => { c[r.category]++; if (claimOf(r.leads_id)?.by === me?.email) c.mine++; });
     return c;
-  }, [eligible, claims, now, me.id]);
+  }, [segEligible, claims, now, me?.email]);
 
   const branches = useMemo(
     () => Array.from(new Set(eligible.map((r) => r.branch))).filter((b) => b !== "—").sort(),
@@ -297,8 +411,8 @@ export default function AppointmentSetterBoard() {
   );
 
   const rows = useMemo(() => {
-    let list = eligible.filter((r) => {
-      if (tab === "mine") { if (claimOf(r.leads_id)?.by !== me.id) return false; }
+    let list = segEligible.filter((r) => {
+      if (tab === "mine") { if (claimOf(r.leads_id)?.by !== me?.email) return false; }
       else if (r.category !== tab) return false;
       if (teamF !== "all" && r.team !== teamF) return false;
       if (branchF !== "all" && r.branch !== branchF) return false;
@@ -315,11 +429,33 @@ export default function AppointmentSetterBoard() {
       stale: (a, b) => (b.hoursSinceTouch ?? 0) - (a.hoursSinceTouch ?? 0),
     }[sort];
     return [...list].sort(cmp);
-  }, [eligible, tab, teamF, branchF, q, sort, claims, now, me.id]);
+  }, [segEligible, tab, teamF, branchF, q, sort, claims, now, me?.email]);
 
-  useEffect(() => setPage(0), [tab, teamF, branchF, q, sort]);
+  useEffect(() => setPage(0), [tab, teamF, branchF, q, sort, ageSeg]);
   const pages = Math.max(1, Math.ceil(rows.length / PAGE));
   const pageRows = rows.slice(page * PAGE, page * PAGE + PAGE);
+
+  if (access === "resolving") {
+    return (
+      <div className="asb"><style>{CSS}</style>
+        <div className="asb-status"><span className="asb-spin" /><p>Checking your access…</p></div>
+      </div>
+    );
+  }
+  if (access === "blocked") {
+    return (
+      <div className="asb"><style>{CSS}</style>
+        <div className="asb-status asb-status-err" style={{ textAlign: "center" }}>
+          <p className="asb-err-title">LifeSource sign-in required</p>
+          <p className="asb-err-hint">
+            You're signed in as <b>{signedEmail}</b>. This board is available to LifeSource
+            employees — please sign in with your @lifesourcewater.com account. Questions? georgia@lifesourcewater.com.
+          </p>
+          <a className="asb-claim" href="/.auth/logout" style={{ textDecoration: "none" }}>Sign out</a>
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div className="asb">
@@ -338,12 +474,26 @@ export default function AppointmentSetterBoard() {
           <button className="asb-ghost" onClick={loadLiveData} title="Re-pull from the live CRM feed">
             <RefreshCw size={14} /> Refresh
           </button>
-          <div className="asb-user">
-            <User size={14} />
-            <select value={userId} onChange={(e) => setUserId(e.target.value)}>
-              {USERS.map((u) => <option key={u.id} value={u.id}>{u.name}{u.role === "admin" ? " · admin" : ""}</option>)}
-            </select>
-          </div>
+          {access === "devpick" ? (
+            <div className="asb-user" title="Preview only — production uses your Entra sign-in">
+              <User size={14} />
+              <select
+                value={me?.email || ""}
+                onChange={(e) => { const em = e.target.value; setMe(em ? { email: em, ...ACCESS_MAP[em] } : null); }}
+              >
+                <option value="">Sign in as…</option>
+                {Object.entries(ACCESS_MAP).map(([em, u]) => (
+                  <option key={em} value={em}>{u.name}{u.role === "admin" ? " · admin" : ""}</option>
+                ))}
+              </select>
+            </div>
+          ) : (
+            <div className="asb-signed">
+              {isAdmin ? <Shield size={13} /> : <User size={13} />}
+              <span>{me?.name}</span>
+              <span className="asb-role">{me?.role}</span>
+            </div>
+          )}
         </div>
       </header>
 
@@ -381,6 +531,16 @@ export default function AppointmentSetterBoard() {
 
       {isAdmin && <FieldDiag records={records} />}
 
+      {/* Age segment — field rep gets the first hour; team works the older pool */}
+      <div className="asb-age">
+        <button className={`asb-age-btn ${ageSeg === "aged" ? "on" : ""}`} onClick={() => setAgeSeg("aged")}>
+          Older — yours to work <span>{ageTotals.aged}</span>
+        </button>
+        <button className={`asb-age-btn fresh ${ageSeg === "fresh" ? "on" : ""}`} onClick={() => setAgeSeg("fresh")}>
+          Just in &lt;1h — field rep's <span>{ageTotals.fresh}</span>
+        </button>
+      </div>
+
       {/* Tabs */}
       <nav className="asb-tabs">
         {TABS.map((t) => (
@@ -410,13 +570,14 @@ export default function AppointmentSetterBoard() {
 
         {pageRows.map((r) => {
           const claim = claimOf(r.leads_id);
-          const mine = claim?.by === me.id;
+          const mine = claim?.by === me?.email;
           const remaining = claim ? claim.expiresAt - now : 0;
           const pct = claim ? Math.max(0, Math.min(100, (remaining / (CLAIM_HOURS * 3.6e6)) * 100)) : 0;
           return (
             <div className={`asb-tr ${claim ? (mine ? "is-mine" : "is-locked") : ""}`} key={r.leads_id}>
               <div className="c-claim">
-                {!claim && <button className="asb-claim" onClick={() => doClaim(r.leads_id)}><Unlock size={13} /> Claim</button>}
+                {!claim && canClaim && <button className="asb-claim" onClick={() => doClaim(r.leads_id)}><Unlock size={13} /> Claim</button>}
+                {!claim && !canClaim && <span className="asb-open">Open</span>}
                 {claim && (
                   <div className={`asb-chip ${mine ? "mine" : "other"}`} title={`${claim.byName} · ${fmtClock(remaining)} left`}>
                     <span className="asb-av">{claim.initials}</span>
@@ -455,8 +616,17 @@ export default function AppointmentSetterBoard() {
                 onMouseMove={(e) => setHover((h) => h && h.rec.leads_id === r.leads_id ? { ...h, x: e.clientX, y: e.clientY } : h)}
                 onMouseLeave={() => setHover(null)}
               >
-                <MessageSquare size={12} className="asb-cmt-ic" />
-                <span className="asb-cmt-txt">{r.lastLine?.text || "—"}</span>
+                <div className="c-cmt-inner">
+                  {r.category === "attempted" && r.lastAttemptBy && (
+                    <span className="asb-lastby" title={`Last outreach attempt: ${r.lastAttemptBy}`}>
+                      ↳ last try: {r.lastAttemptBy}
+                    </span>
+                  )}
+                  <span className="asb-cmt-line">
+                    <MessageSquare size={12} className="asb-cmt-ic" />
+                    <span className="asb-cmt-txt">{r.lastLine?.text || "—"}</span>
+                  </span>
+                </div>
               </div>
 
               <div className="c-date">{r.lead_date_in}</div>
@@ -543,6 +713,9 @@ const CSS = `
 .asb-ghost:hover{border-color:#cbd5e1;}
 .asb-user{display:flex;align-items:center;gap:6px;background:var(--surface);border:1px solid var(--line);border-radius:8px;padding:5px 9px;color:var(--slate);}
 .asb-user select{border:none;background:none;font:inherit;color:var(--ink);outline:none;cursor:pointer;}
+.asb-signed{display:flex;align-items:center;gap:6px;background:var(--surface);border:1px solid var(--line);border-radius:8px;padding:6px 11px;color:var(--ink);font-size:12px;font-weight:560;}
+.asb-signed .asb-role{font-size:9.5px;text-transform:uppercase;letter-spacing:.04em;background:#eef1f6;color:var(--slate);border-radius:5px;padding:1px 6px;font-weight:680;}
+.asb-open{font-size:11px;color:var(--muted);font-style:italic;}
 
 .asb-controls{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:14px;}
 .asb-search{display:flex;align-items:center;gap:7px;background:var(--surface);border:1px solid var(--line);border-radius:9px;padding:8px 11px;flex:1;min-width:220px;color:var(--muted);}
@@ -634,6 +807,18 @@ const CSS = `
 .asb-diag-field{font-family:ui-monospace,Menlo,monospace;font-size:11px;font-weight:680;color:var(--ink);border-bottom:1px solid var(--line);padding-bottom:4px;margin-bottom:5px;}
 .asb-diag-row{display:flex;justify-content:space-between;gap:10px;font-size:11.5px;color:var(--slate);padding:2px 0;}
 .asb-diag-row b{font-family:ui-monospace,Menlo,monospace;color:var(--ink);}
+
+.asb-age{display:flex;gap:8px;margin:12px 0 2px;}
+.asb-age-btn{display:flex;align-items:center;gap:8px;background:#fff;border:1px solid var(--line);border-radius:9px;padding:8px 13px;font:inherit;font-size:12.5px;font-weight:560;color:var(--slate);cursor:pointer;}
+.asb-age-btn span{font-family:ui-monospace,Menlo,monospace;background:#eef1f6;border-radius:20px;padding:1px 8px;font-size:11px;}
+.asb-age-btn.on{border-color:var(--teal);color:var(--teal);background:#f0fdfa;}
+.asb-age-btn.on span{background:var(--teal);color:#fff;}
+.asb-age-btn.fresh.on{border-color:var(--amber);color:var(--amber);background:#fff7ed;}
+.asb-age-btn.fresh.on span{background:var(--amber);color:#fff;}
+
+.c-cmt-inner{min-width:0;display:flex;flex-direction:column;gap:2px;}
+.asb-cmt-line{display:flex;align-items:center;gap:6px;min-width:0;}
+.asb-lastby{align-self:flex-start;background:#fef3c7;color:#92400e;border-radius:5px;padding:1px 7px;font-size:10.5px;font-weight:620;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:100%;}
 
 @media (max-width:1100px){
   .asb-tr{grid-template-columns:110px 1.2fr 1fr 70px 80px 1.6fr 78px;}
