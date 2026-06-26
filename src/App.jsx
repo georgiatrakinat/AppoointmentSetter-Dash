@@ -39,8 +39,13 @@ const CRM_RECORD_URL = (leadId) =>
 
 // Lost-sale detection — ported verbatim from the SalesRep dash (LOST_RE + status 6).
 const LOST_RE = /\blost\s+sale\b|\bmark(?:ing|ed)?\s+(?:as\s+)?lost\b|\blost\s+to\s+\w+|\bnot\s+closable\b|\bdead\s+lead\b|\blost\s+cause\b|\bclosed\s+lost\b|\bdo[\s-]+not[\s-]+sell\b|\bdon['’]?t\s+sell\b|\bunable\s+to\s+install\b[\s\w-]{0,40}?\bsystem\b/i;
-// EM Duggan partner channel — excluded from the pool (matches SalesRep POOL_EXCLUDE_RE).
+// EM Duggan partner channel — excluded from the pool (SalesRep POOL_EXCLUDE_RE pattern).
+// Scans rep name + account name + comments; the "E M" prefix keeps plain "Duggan" surnames safe.
 const POOL_EXCLUDE_RE = /\be\.?\s*m\.?\s*duggan\b/i;
+const isDuggan = (r) =>
+  POOL_EXCLUDE_RE.test(r.salesreps_name || "") ||
+  POOL_EXCLUDE_RE.test(r.account_name || "") ||
+  POOL_EXCLUDE_RE.test(r.comments || "");
 
 // sLeads are tagged in account_type, e.g. "sLead / Relead". Match the sLead token.
 const isSLead = (r) => /\bs[-\s]?lead/i.test(String(r.account_type || ""));
@@ -188,7 +193,11 @@ function deriveMilestone(r) {
   if (isVal(r.Dialed)) return "Dialed";
   return "New";
 }
-const apptBooked = (r) => isVal(r["Set Appt"]) || isVal(r["Appt. Completed"]) || isVal(r["CDR Appt. Done"]);
+// Drop anything that has reached Set Appt or any later milestone (4-8 in the CRM:
+// Set Appt, Appt Completed, CDR Appt Done, Quote sent, Letter Sent).
+const pastApptStage = (r) =>
+  isVal(r["Set Appt"]) || isVal(r["Appt. Completed"]) || isVal(r["CDR Appt. Done"]) ||
+  isVal(r["Quote Sent"]) || isVal(r["Letter Sent"]);
 const isLost = (r) =>
   r.status_id === 6 || /lost\s*sale/i.test(r.status || "") || LOST_RE.test(r.comments || "");
 const isResidential = (r) => String(r.professional).toLowerCase() !== "true" && !isCommercial(r);
@@ -385,8 +394,8 @@ export default function AppointmentSetterBoard() {
       if (isSLead(r)) return false;               // drop sLeads
       if (String(r.relead || "").trim().toLowerCase() === "y") return false; // drop releads
       if (isLost(r)) return false;                // drop lost
-      if (apptBooked(r)) return false;            // drop already-booked
-      if (POOL_EXCLUDE_RE.test(r.salesreps_name || "")) return false; // drop EM Duggan
+      if (pastApptStage(r)) return false;         // drop Set Appt or any later milestone
+      if (isDuggan(r)) return false;              // drop EM Duggan partner channel
       if (EXCLUDED_ACCOUNT_CLASSES.includes(String(r.account_class || "").trim().toLowerCase())) return false; // drop prospects/customers
       return true;                                // fresh (<1h) kept; segmented in the UI
     });
