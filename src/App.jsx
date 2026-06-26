@@ -41,8 +41,13 @@ const CRM_RECORD_URL = (leadId) =>
 const LOST_RE = /(do\s*-?\s*not\s*sell|don'?t\s*sell|unable to install\s+(?:our\s+|the\s+|whole[-\s]?house\s+)?(?:system|whole[-\s]?house))/i;
 const LOST_EXCLUDE_RE = /unable to install\s+(?:until|next|on|by|this|in|the week)/i;
 
-const isSLead = (_r) => false;         // PROD: identify sLeads (field/marker still TBD)
+const isSLead = (r) =>
+  SLEAD_ACCOUNT_TYPES.includes(String(r.account_type || "").trim().toLowerCase());
 const isCommercial = (_r) => false;    // PROD: commercial field name still unconfirmed in feed
+
+// Fill these once the admin diagnostic panel shows the real values.
+const SLEAD_ACCOUNT_TYPES = [];        // e.g. ["slead"] — account_type value(s) that mark an sLead
+const EXCLUDED_ACCOUNT_CLASSES = [];   // e.g. ["secondary"] — account_class value(s) to drop
 const BRANCH_BY_REP = {                // PROD: real roster
   "Richard Foronda": "Pasadena",
   "Diego Soc Domingo": "Pasadena",
@@ -117,6 +122,10 @@ function enrich(r, now) {
   const repName = (r.salesreps_name || "").replace(/\s*-\s*National Sales\s*$/i, "").trim();
   const lastTouchMs = p.lastTs ? Date.parse(p.lastTs.replace(" ", "T")) : null;
   const firstMs = p.firstTs ? Date.parse(p.firstTs.replace(" ", "T")) : Date.parse(r.lead_date_in + "T00:00:00");
+  // Exact lead-in timestamp now available; fall back to first comment if missing.
+  const leadInMs = isVal(r.lead_created_time)
+    ? Date.parse(String(r.lead_created_time).replace(" ", "T"))
+    : firstMs;
   const contacted = p.contacted || isVal(r.Contact);
   let category = "nocontact";
   if (contacted) category = "contacted";
@@ -133,6 +142,7 @@ function enrich(r, now) {
     lastLine: p.lastLine,
     lastTouchMs,
     firstMs,
+    leadInMs,
     hoursSinceTouch: lastTouchMs ? (now - lastTouchMs) / 3.6e6 : null,
     category,
   };
@@ -159,6 +169,41 @@ const TABS = [
   { id: "contacted", label: "Contacted · no appt" },
   { id: "mine", label: "My queue" },
 ];
+
+function FieldDiag({ records }) {
+  const [open, setOpen] = useState(false);
+  const fields = ["account_type", "account_class", "relead", "water_type", "status"];
+  const summary = useMemo(() => {
+    return fields.map((f) => {
+      const counts = {};
+      (records || []).forEach((r) => {
+        const v = r[f] === null || r[f] === undefined || r[f] === "" ? "(blank)" : String(r[f]);
+        counts[v] = (counts[v] || 0) + 1;
+      });
+      const vals = Object.entries(counts).sort((a, b) => b[1] - a[1]);
+      return { f, vals };
+    });
+  }, [records]);
+  return (
+    <div className="asb-diag">
+      <button className="asb-diag-toggle" onClick={() => setOpen((o) => !o)}>
+        <Shield size={13} /> Admin · field values {open ? "▾" : "▸"}
+      </button>
+      {open && (
+        <div className="asb-diag-grid">
+          {summary.map(({ f, vals }) => (
+            <div className="asb-diag-col" key={f}>
+              <div className="asb-diag-field">{f}</div>
+              {vals.map(([v, n]) => (
+                <div className="asb-diag-row" key={v}><span>{v}</span><b>{n}</b></div>
+              ))}
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
 
 export default function AppointmentSetterBoard() {
   const [now, setNow] = useState(Date.now());
@@ -234,7 +279,8 @@ export default function AppointmentSetterBoard() {
       if (isSLead(r)) return false;               // drop sLeads
       if (isLost(r)) return false;                // drop lost
       if (apptBooked(r)) return false;            // drop already-booked
-      if (now - r.firstMs < ELIGIBILITY_HOURS * 3.6e6) return false; // field rep's first hour
+      if (EXCLUDED_ACCOUNT_CLASSES.includes(String(r.account_class || "").trim().toLowerCase())) return false;
+      if (now - r.leadInMs < ELIGIBILITY_HOURS * 3.6e6) return false; // field rep's first hour
       return true;
     });
   }, [records, now]);
@@ -332,6 +378,8 @@ export default function AppointmentSetterBoard() {
         <Pick label="Branch" value={branchF} onChange={setBranchF} opts={[["all", "All branches"], ...branches.map((b) => [b, b])]} />
         <Pick label="Sort" value={sort} onChange={setSort} opts={[["newest", "Newest lead in"], ["oldest", "Oldest lead in"], ["touches", "Most touches"], ["stale", "Longest since touch"]]} />
       </div>
+
+      {isAdmin && <FieldDiag records={records} />}
 
       {/* Tabs */}
       <nav className="asb-tabs">
@@ -578,6 +626,14 @@ const CSS = `
 .asb-err-title{font-weight:680;font-size:15px;color:var(--red);margin:0;}
 .asb-err-detail{font-family:ui-monospace,Menlo,monospace;font-size:12px;color:var(--slate);background:#f5f7fa;border-radius:7px;padding:8px 10px;margin:0;}
 .asb-err-hint{font-size:12px;color:var(--muted);margin:0;line-height:1.5;}
+
+.asb-diag{margin:10px 0 0;}
+.asb-diag-toggle{display:inline-flex;align-items:center;gap:6px;background:#f3f0ff;color:var(--indigo);border:1px solid #e0d8ff;border-radius:8px;padding:6px 11px;font:inherit;font-size:12px;font-weight:560;cursor:pointer;}
+.asb-diag-grid{display:flex;gap:14px;flex-wrap:wrap;background:#fff;border:1px solid var(--line);border-radius:10px;padding:12px 14px;margin-top:8px;}
+.asb-diag-col{min-width:150px;}
+.asb-diag-field{font-family:ui-monospace,Menlo,monospace;font-size:11px;font-weight:680;color:var(--ink);border-bottom:1px solid var(--line);padding-bottom:4px;margin-bottom:5px;}
+.asb-diag-row{display:flex;justify-content:space-between;gap:10px;font-size:11.5px;color:var(--slate);padding:2px 0;}
+.asb-diag-row b{font-family:ui-monospace,Menlo,monospace;color:var(--ink);}
 
 @media (max-width:1100px){
   .asb-tr{grid-template-columns:110px 1.2fr 1fr 70px 80px 1.6fr 78px;}
