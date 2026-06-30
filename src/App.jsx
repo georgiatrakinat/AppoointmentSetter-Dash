@@ -209,16 +209,25 @@ const isResidential = (r) => String(r.professional).toLowerCase() !== "true" && 
 function enrich(r, now) {
   const p = parseComments(r.comments);
   const repName = (r.salesreps_name || "").replace(/\s*-\s*National Sales\s*$/i, "").trim();
-  const lastTouchMs = p.lastTs ? Date.parse(p.lastTs.replace(" ", "T")) : null;
   const firstMs = p.firstTs ? Date.parse(p.firstTs.replace(" ", "T")) : Date.parse(r.lead_date_in + "T00:00:00");
   // Exact lead-in timestamp now available; fall back to first comment if missing.
   const leadInMs = isVal(r.lead_created_time)
     ? Date.parse(String(r.lead_created_time).replace(" ", "T"))
     : firstMs;
   const contacted = p.contacted || isVal(r.Contact);
+  // Any commentary entry counts as a touch; never undercount below populated stage
+  // columns (Dialed/Email/Contact). Last touch = latest of last comment or stage date.
+  const stageTouches = [r.Dialed, r["Email Sent"], r.Contact].filter(isVal).length;
+  const commentEntries = p.lines.filter((l) => l.ts).length;
+  const touches = Math.max(commentEntries, stageTouches);
+  const lastTouchMs = (() => {
+    const ds = [r.Dialed, r["Email Sent"], r.Contact, p.lastTs]
+      .filter(isVal).map((d) => Date.parse(String(d).replace(" ", "T"))).filter((n) => !isNaN(n));
+    return ds.length ? Math.max(...ds) : null;
+  })();
   let category = "nocontact";
   if (contacted) category = "contacted";
-  else if (p.touches > 0) category = "attempted";
+  else if (touches > 0) category = "attempted";
   // Roster lookup drives team + branch (name suffix alone is unreliable; see Richard Foronda).
   const ro = ROSTER[repKey(r.salesreps_name)];
   const teamVal = ro ? ro.t : (/national sales/i.test(r.salesreps_name || "") ? "NST" : "Field");
@@ -230,7 +239,7 @@ function enrich(r, now) {
     branch,
     team: teamVal,
     milestone: deriveMilestone(r),
-    touches: p.touches,
+    touches: touches,
     contacted,
     lastAttemptBy: p.lastAttemptBy,
     lastAttemptTs: p.lastAttemptTs,
