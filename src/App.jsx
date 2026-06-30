@@ -47,6 +47,10 @@ const isDuggan = (r) =>
   POOL_EXCLUDE_RE.test(r.account_name || "") ||
   POOL_EXCLUDE_RE.test(r.comments || "");
 
+// Aggregator / placeholder records that show up in the customer name: Yelp, brand, corporate.
+// Word boundaries keep real names safe (e.g. "Brandon" won't match "brand").
+const isJunkName = (r) => /\b(yelp|brand|corporate)\b/i.test(r.account_name || "");
+
 // sLeads are tagged in account_type, e.g. "sLead / Relead". Match the sLead token.
 const isSLead = (r) => /\bs[-\s]?lead/i.test(String(r.account_type || ""));
 const isCommercial = (_r) => false;    // PROD: commercial field name still unconfirmed in feed
@@ -308,8 +312,13 @@ export default function AppointmentSetterBoard() {
   const [q, setQ] = useState("");
   const [teamF, setTeamF] = useState("all");
   const [branchF, setBranchF] = useState("all");
+  const [repF, setRepF] = useState("all");
+  const [touchWin, setTouchWin] = useState("any");
+  const [leadWin, setLeadWin] = useState("any");
   const [sort, setSort] = useState("newest");
   const [ageSeg, setAgeSeg] = useState("aged"); // aged (>1h) | fresh (<1h)
+  const [sel, setSel] = useState(() => new Set()); // admin multi-select
+  const [assignTo, setAssignTo] = useState("");
   const [page, setPage] = useState(0);
   const [hover, setHover] = useState(null); // {rec, x, y}
   const [records, setRecords] = useState(null); // raw feed (null=loading)
@@ -372,20 +381,14 @@ export default function AppointmentSetterBoard() {
     return () => clearInterval(t);
   }, []);
 
-  const claimOf = (id) => {
-    const c = claims[id];
-    if (!c || c.expiresAt <= now) return null; // expired = auto-released
-    return c;
-  };
+  const claimOf = (id) => claims[id] || null; // claims persist until released
   const canClaim = me && (me.role === "setter" || me.role === "admin");
   const saveClaim = (id, claim) => setClaims((p) => ({ ...p, [id]: claim })); // PROD: POST to shared store
-  const doClaim = (id) => {
-    if (!canClaim) return;
-    saveClaim(id, { by: me.email, byName: me.name, initials: me.initials, at: now, expiresAt: now + CLAIM_HOURS * 3.6e6 });
-  };
+  const claimFor = (user) => ({ by: user.email, byName: user.name, initials: user.initials, at: now });
+  const doClaim = (id) => { if (canClaim) saveClaim(id, claimFor(me)); };
   const doRelease = (id) => setClaims((p) => { const n = { ...p }; delete n[id]; return n; });
-  const doExtend = (id) =>
-    setClaims((p) => ({ ...p, [id]: { ...p[id], expiresAt: now + CLAIM_HOURS * 3.6e6 } }));
+  const assignMany = (ids, user) =>
+    setClaims((p) => { const n = { ...p }; ids.forEach((id) => { n[id] = claimFor(user); }); return n; });
 
   // enrich + eligibility filter
   const eligible = useMemo(() => {
@@ -396,6 +399,7 @@ export default function AppointmentSetterBoard() {
       if (isLost(r)) return false;                // drop lost
       if (pastApptStage(r)) return false;         // drop Set Appt or any later milestone
       if (isDuggan(r)) return false;              // drop EM Duggan partner channel
+      if (isJunkName(r)) return false;            // drop Yelp / brand / corporate placeholder records
       if (EXCLUDED_ACCOUNT_CLASSES.includes(String(r.account_class || "").trim().toLowerCase())) return false; // drop prospects/customers
       return true;                                // fresh (<1h) kept; segmented in the UI
     });
@@ -418,6 +422,22 @@ export default function AppointmentSetterBoard() {
     () => Array.from(new Set(eligible.map((r) => r.branch))).filter((b) => b !== "—").sort(),
     [eligible]
   );
+  const reps = useMemo(
+    () => Array.from(new Set(eligible.map((r) => r.repName).filter(Boolean))).sort(),
+    [eligible]
+  );
+
+  // Time-window filter: hours-old vs selected bucket. null age never matches a bounded window.
+  const inWindow = (hrs, win) => {
+    if (win === "any") return true;
+    if (hrs == null) return false;
+    if (win === "24h") return hrs <= 24;
+    if (win === "3d") return hrs <= 72;
+    if (win === "7d") return hrs <= 168;
+    if (win === "older") return hrs > 168;
+    return true;
+  };
+  const WIN_OPTS = [["any", "Any time"], ["24h", "≤ 24 hrs"], ["3d", "≤ 3 days"], ["7d", "≤ 7 days"], ["older", "Older (7d+)"]];
 
   const rows = useMemo(() => {
     let list = segEligible.filter((r) => {
@@ -425,6 +445,9 @@ export default function AppointmentSetterBoard() {
       else if (r.category !== tab) return false;
       if (teamF !== "all" && r.team !== teamF) return false;
       if (branchF !== "all" && r.branch !== branchF) return false;
+      if (repF !== "all" && r.repName !== repF) return false;
+      if (!inWindow(r.hoursSinceTouch, touchWin)) return false;
+      if (!inWindow((now - r.leadInMs) / 3.6e6, leadWin)) return false;
       if (q) {
         const hay = `${r.account_name} ${r.repName} ${r.leads_id}`.toLowerCase();
         if (!hay.includes(q.toLowerCase())) return false;
@@ -438,11 +461,13 @@ export default function AppointmentSetterBoard() {
       stale: (a, b) => (b.hoursSinceTouch ?? 0) - (a.hoursSinceTouch ?? 0),
     }[sort];
     return [...list].sort(cmp);
-  }, [segEligible, tab, teamF, branchF, q, sort, claims, now, me?.email]);
+  }, [segEligible, tab, teamF, branchF, repF, touchWin, leadWin, q, sort, claims, now, me?.email]);
 
-  useEffect(() => setPage(0), [tab, teamF, branchF, q, sort, ageSeg]);
+  useEffect(() => setPage(0), [tab, teamF, branchF, repF, touchWin, leadWin, q, sort, ageSeg]);
+  useEffect(() => setSel(new Set()), [tab, teamF, branchF, repF, touchWin, leadWin, q, sort, ageSeg, page]);
   const pages = Math.max(1, Math.ceil(rows.length / PAGE));
   const pageRows = rows.slice(page * PAGE, page * PAGE + PAGE);
+  const toggleSel = (id) => setSel((s) => { const n = new Set(s); n.has(id) ? n.delete(id) : n.add(id); return n; });
 
   if (access === "resolving") {
     return (
@@ -535,6 +560,9 @@ export default function AppointmentSetterBoard() {
         </div>
         <Seg label="Team" value={teamF} onChange={setTeamF} opts={[["all", "All"], ["Field", "Field"], ["NST", "NST"]]} />
         <Pick label="Branch" value={branchF} onChange={setBranchF} opts={[["all", "All branches"], ...branches.map((b) => [b, b])]} />
+        <Pick label="Rep" value={repF} onChange={setRepF} opts={[["all", "All reps"], ...reps.map((r) => [r, r])]} />
+        <Pick label="Since touch" value={touchWin} onChange={setTouchWin} opts={WIN_OPTS} />
+        <Pick label="Lead in" value={leadWin} onChange={setLeadWin} opts={WIN_OPTS} />
         <Pick label="Sort" value={sort} onChange={setSort} opts={[["newest", "Newest lead in"], ["oldest", "Oldest lead in"], ["touches", "Most touches"], ["stale", "Longest since touch"]]} />
       </div>
 
@@ -559,15 +587,35 @@ export default function AppointmentSetterBoard() {
         ))}
       </nav>
 
+      {/* Admin bulk-assign */}
+      {isAdmin && sel.size > 0 && (
+        <div className="asb-bulk">
+          <b>{sel.size}</b> selected
+          <select value={assignTo} onChange={(e) => setAssignTo(e.target.value)}>
+            <option value="">Assign to…</option>
+            {Object.entries(ACCESS_MAP).filter(([, u]) => u.role === "setter").map(([em, u]) => (
+              <option key={em} value={em}>{u.name}</option>
+            ))}
+          </select>
+          <button className="asb-claim" disabled={!assignTo}
+            onClick={() => { assignMany([...sel], { email: assignTo, ...ACCESS_MAP[assignTo] }); setSel(new Set()); setAssignTo(""); }}>
+            Assign to queue
+          </button>
+          <button className="asb-bulk-clear" onClick={() => setSel(new Set())}>Clear</button>
+        </div>
+      )}
+
       {/* Table */}
-      <div className="asb-table">
+      <div className={`asb-table ${isAdmin ? "asb-admin" : ""}`}>
         <div className="asb-tr asb-th">
+          {isAdmin && <div className="c-sel"></div>}
           <div className="c-claim">Claim</div>
           <div className="c-cust">Customer</div>
+          <div className="c-lid">Lead ID</div>
           <div className="c-rep">Rep · Branch</div>
           <div className="c-ms">Milestone</div>
           <div className="c-num">Touches</div>
-          <div className="c-num">Since touch</div>
+          <div className="c-num">Time since last touch</div>
           <div className="c-cmt">Last comment</div>
           <div className="c-date">Lead in</div>
           <div className="c-act"></div>
@@ -580,32 +628,32 @@ export default function AppointmentSetterBoard() {
         {pageRows.map((r) => {
           const claim = claimOf(r.leads_id);
           const mine = claim?.by === me?.email;
-          const remaining = claim ? claim.expiresAt - now : 0;
-          const pct = claim ? Math.max(0, Math.min(100, (remaining / (CLAIM_HOURS * 3.6e6)) * 100)) : 0;
+          const checked = sel.has(r.leads_id);
           return (
-            <div className={`asb-tr ${claim ? (mine ? "is-mine" : "is-locked") : ""}`} key={r.leads_id}>
+            <div className={`asb-tr ${claim ? (mine ? "is-mine" : "is-locked") : ""} ${checked ? "is-sel" : ""}`} key={r.leads_id}>
+              {isAdmin && (
+                <div className="c-sel">
+                  <input type="checkbox" checked={checked} onChange={() => toggleSel(r.leads_id)} />
+                </div>
+              )}
               <div className="c-claim">
                 {!claim && canClaim && <button className="asb-claim" onClick={() => doClaim(r.leads_id)}><Unlock size={13} /> Claim</button>}
                 {!claim && !canClaim && <span className="asb-open">Open</span>}
                 {claim && (
-                  <div className={`asb-chip ${mine ? "mine" : "other"}`} title={`${claim.byName} · ${fmtClock(remaining)} left`}>
+                  <div className={`asb-chip ${mine ? "mine" : "other"}`} title={`Claimed by ${claim.byName}${claim.at ? ` · ${fmtDur(now - claim.at)} ago` : ""}`}>
                     <span className="asb-av">{claim.initials}</span>
-                    <span className="asb-time"><Clock size={11} />{fmtClock(remaining)}</span>
-                    <span className="asb-bar"><i style={{ width: `${pct}%` }} /></span>
+                    <span className="asb-claimed">{(claim.byName || "").split(" ")[0]}</span>
                   </div>
                 )}
                 {claim && (mine || isAdmin) && (
                   <div className="asb-claim-actions">
-                    <button onClick={() => doRelease(r.leads_id)} title="Release">Release</button>
-                    {isAdmin && <button onClick={() => doExtend(r.leads_id)} title="Reset to 24h">Extend</button>}
+                    <button onClick={() => doRelease(r.leads_id)} title="Release back to the pool">Release</button>
                   </div>
                 )}
               </div>
 
-              <div className="c-cust">
-                <span className="asb-name">{r.account_name}</span>
-                <span className="asb-id">#{r.leads_id}</span>
-              </div>
+              <div className="c-cust"><span className="asb-name">{r.account_name}</span></div>
+              <div className="c-lid">#{r.leads_id}</div>
 
               <div className="c-rep">
                 <span className="asb-rep">{r.repName}</span>
@@ -745,28 +793,37 @@ const CSS = `
 .asb-count{background:#eef1f6;color:var(--slate);border-radius:20px;padding:1px 8px;font-size:11px;}
 .asb-tab.on .asb-count{background:var(--indigo);color:#fff;}
 
-.asb-table{background:var(--surface);border:1px solid var(--line);border-radius:12px;overflow:hidden;margin-top:10px;}
-.asb-tr{display:grid;grid-template-columns:118px 1.3fr 1.2fr .9fr 72px 88px 2fr 88px 78px;gap:12px;align-items:center;padding:11px 14px;border-bottom:1px solid var(--line);}
+.asb-table{background:var(--surface);border:1px solid var(--line);border-radius:12px;overflow-x:auto;margin-top:10px;}
+.asb-tr{display:grid;grid-template-columns:116px 1.1fr 72px 1.15fr .8fr 62px 116px 1.6fr 80px 74px;gap:12px;align-items:center;padding:11px 14px;border-bottom:1px solid var(--line);min-width:1060px;}
+.asb-table.asb-admin .asb-tr{grid-template-columns:30px 116px 1.1fr 72px 1.15fr .8fr 62px 116px 1.6fr 80px 74px;min-width:1100px;}
 .asb-tr:last-child{border-bottom:none;}
 .asb-th{background:#fafbfc;color:var(--muted);font-size:10.5px;text-transform:uppercase;letter-spacing:.05em;font-weight:620;padding-top:9px;padding-bottom:9px;}
 .asb-tr.is-mine{background:#f6f5ff;}
-.asb-tr.is-locked{background:#fbfbfc;opacity:.78;}
-.c-num,.c-date{font-size:12px;color:var(--slate);}
+.asb-tr.is-locked{background:#fbfbfc;}
+.asb-tr.is-sel{background:#eff6ff;}
+.c-num,.c-date,.c-lid{font-size:12px;color:var(--slate);}
+.c-lid{font-family:ui-monospace,Menlo,monospace;}
+.c-sel{display:flex;align-items:center;justify-content:center;}
+.c-sel input{width:15px;height:15px;cursor:pointer;}
 
 .asb-claim{display:flex;align-items:center;gap:5px;background:var(--indigo);color:#fff;border:none;border-radius:7px;padding:6px 10px;font:inherit;font-weight:560;cursor:pointer;font-size:12px;}
 .asb-claim:hover{background:#4338ca;}
-.asb-chip{display:flex;flex-direction:column;gap:3px;}
-.asb-chip .asb-av{display:inline-flex;align-items:center;justify-content:center;width:22px;height:22px;border-radius:6px;font-size:10px;font-weight:680;color:#fff;}
+.asb-chip{display:flex;align-items:center;gap:6px;}
+.asb-chip .asb-av{display:inline-flex;align-items:center;justify-content:center;width:22px;height:22px;border-radius:6px;font-size:10px;font-weight:680;color:#fff;flex:none;}
 .asb-chip.mine .asb-av{background:var(--indigo);}
 .asb-chip.other .asb-av{background:var(--slate);}
-.asb-chip{position:relative;}
-.asb-time{display:flex;align-items:center;gap:3px;font-size:11px;color:var(--slate);}
-.asb-bar{display:block;height:3px;background:#e4e8ee;border-radius:3px;overflow:hidden;width:64px;}
-.asb-bar i{display:block;height:100%;background:var(--indigo);transition:width .4s;}
-.asb-chip.other .asb-bar i{background:var(--slate);}
+.asb-claimed{font-size:11.5px;font-weight:560;color:var(--slate);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+.asb-chip.mine .asb-claimed{color:var(--indigo);}
 .asb-claim-actions{display:flex;gap:4px;margin-top:4px;}
 .asb-claim-actions button{border:1px solid var(--line);background:#fff;border-radius:6px;padding:3px 7px;font:inherit;font-size:10.5px;color:var(--slate);cursor:pointer;}
 .asb-claim-actions button:hover{border-color:var(--red);color:var(--red);}
+
+.asb-bulk{display:flex;align-items:center;gap:10px;background:#eef2ff;border:1px solid #d6dcff;border-radius:10px;padding:9px 13px;margin-top:12px;font-size:12.5px;color:var(--slate);}
+.asb-bulk b{font-family:ui-monospace,Menlo,monospace;color:var(--indigo);}
+.asb-bulk select{background:#fff;border:1px solid var(--line);border-radius:8px;padding:6px 10px;font:inherit;font-size:12px;color:var(--ink);cursor:pointer;}
+.asb-bulk .asb-claim{padding:6px 12px;}
+.asb-bulk .asb-claim:disabled{opacity:.45;cursor:default;}
+.asb-bulk-clear{background:none;border:none;color:var(--muted);font:inherit;font-size:12px;cursor:pointer;text-decoration:underline;}
 
 .asb-name{font-weight:600;display:block;}
 .asb-id{color:var(--muted);font-size:11px;}
@@ -830,7 +887,6 @@ const CSS = `
 .asb-lastby{align-self:flex-start;background:#fef3c7;color:#92400e;border-radius:5px;padding:1px 7px;font-size:10.5px;font-weight:620;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:100%;}
 
 @media (max-width:1100px){
-  .asb-tr{grid-template-columns:110px 1.2fr 1fr 70px 80px 1.6fr 78px;}
-  .c-ms,.c-date{display:none;}
+  .asb-controls{gap:8px;}
 }
 `;
