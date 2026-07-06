@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useMemo, useRef } from "react";
 import {
   Lock, Unlock, Phone, Mail, Clock, ExternalLink, Search,
-  ChevronLeft, ChevronRight, RefreshCw, Shield, User, MessageSquare
+  ChevronLeft, ChevronRight, RefreshCw, Shield, User, MessageSquare, Download
 } from "lucide-react";
 
 /* =========================================================================
@@ -50,6 +50,11 @@ const isDuggan = (r) =>
 // Aggregator / placeholder records that show up in the customer name: Yelp, brand, corporate.
 // Word boundaries keep real names safe (e.g. "Brandon" won't match "brand").
 const isJunkName = (r) => /\b(yelp|brand|corporate)\b/i.test(r.account_name || "");
+
+// Free-text signals that a live conversation happened, beyond the structured
+// "Dialed Contact: Contacted" marker and the Contact date column. Kept conservative
+// so failed attempts ("left message", "no answer", "disconnected") don't match.
+const CONTACTED_TEXT_RE = /\b(spoke|talked)\s+(to|with)\b|\b(customer|client|cust|he|she|they)\s+(said|says|mentioned|asked|answered)\b|\b(customer|client|cust)\s+(wants|needs|would\s+like|prefers|is\s+interested|is\s+looking|are\s+looking)\b|\banswered\s+the\s+(phone|call)\b|\bon\s+the\s+phone\s+with\b|\bpicked\s*up\b|\breached\s+(the\s+)?(customer|client|him|her|them)\b/i;
 
 // sLeads are tagged in account_type, e.g. "sLead / Relead". Match the sLead token.
 const isSLead = (r) => /\bs[-\s]?lead/i.test(String(r.account_type || ""));
@@ -214,7 +219,7 @@ function enrich(r, now) {
   const leadInMs = isVal(r.lead_created_time)
     ? Date.parse(String(r.lead_created_time).replace(" ", "T"))
     : firstMs;
-  const contacted = p.contacted || isVal(r.Contact);
+  const contacted = p.contacted || isVal(r.Contact) || CONTACTED_TEXT_RE.test(r.comments || "");
   // Any commentary entry counts as a touch; never undercount below populated stage
   // columns (Dialed/Email/Contact). Last touch = latest of last comment or stage date.
   const stageTouches = [r.Dialed, r["Email Sent"], r.Contact].filter(isVal).length;
@@ -249,6 +254,7 @@ function enrich(r, now) {
     firstMs,
     leadInMs,
     ageBucket,
+    searchBlob: `${r.account_name || ""} ${repName} ${r.leads_id} ${r.comments || ""}`.toLowerCase(),
     hoursSinceTouch: lastTouchMs ? (now - lastTouchMs) / 3.6e6 : null,
     category,
   };
@@ -328,6 +334,7 @@ export default function AppointmentSetterBoard() {
   const [ageSeg, setAgeSeg] = useState("aged"); // aged (>1h) | fresh (<1h)
   const [sel, setSel] = useState(() => new Set()); // admin multi-select
   const [assignTo, setAssignTo] = useState("");
+  const [showAll, setShowAll] = useState(false);
   const [page, setPage] = useState(0);
   const [hover, setHover] = useState(null); // {rec, x, y}
   const [records, setRecords] = useState(null); // raw feed (null=loading)
@@ -414,19 +421,6 @@ export default function AppointmentSetterBoard() {
     });
   }, [records, now]);
 
-  const ageTotals = useMemo(() => {
-    const t = { fresh: 0, aged: 0 };
-    eligible.forEach((r) => { t[r.ageBucket]++; });
-    return t;
-  }, [eligible]);
-  const segEligible = useMemo(() => eligible.filter((r) => r.ageBucket === ageSeg), [eligible, ageSeg]);
-
-  const counts = useMemo(() => {
-    const c = { nocontact: 0, attempted: 0, contacted: 0, mine: 0 };
-    segEligible.forEach((r) => { c[r.category]++; if (claimOf(r.leads_id)?.by === me?.email) c.mine++; });
-    return c;
-  }, [segEligible, claims, now, me?.email]);
-
   const branches = useMemo(
     () => Array.from(new Set(eligible.map((r) => r.branch))).filter((b) => b !== "—").sort(),
     [eligible]
@@ -448,20 +442,38 @@ export default function AppointmentSetterBoard() {
   };
   const WIN_OPTS = [["any", "Any time"], ["24h", "≤ 24 hrs"], ["3d", "≤ 3 days"], ["7d", "≤ 7 days"], ["older", "Older (7d+)"]];
 
-  const rows = useMemo(() => {
-    let list = segEligible.filter((r) => {
-      if (tab === "mine") { if (claimOf(r.leads_id)?.by !== me?.email) return false; }
-      else if (r.category !== tab) return false;
+  // All row-level filters EXCEPT the age segment and the category tab. Counts derive
+  // from this so the tab totals (and age-segment totals) reflect the active filters.
+  const baseFiltered = useMemo(() => {
+    const qlc = q.trim().toLowerCase();
+    return eligible.filter((r) => {
       if (teamF !== "all" && r.team !== teamF) return false;
       if (branchF !== "all" && r.branch !== branchF) return false;
       if (repF !== "all" && r.repName !== repF) return false;
       if (!inWindow(r.hoursSinceTouch, touchWin)) return false;
       if (!inWindow((now - r.leadInMs) / 3.6e6, leadWin)) return false;
-      if (q) {
-        const hay = `${r.account_name} ${r.repName} ${r.leads_id}`.toLowerCase();
-        if (!hay.includes(q.toLowerCase())) return false;
-      }
+      if (qlc && !r.searchBlob.includes(qlc)) return false;
       return true;
+    });
+  }, [eligible, teamF, branchF, repF, touchWin, leadWin, q, now]);
+
+  const ageTotals = useMemo(() => {
+    const t = { fresh: 0, aged: 0 };
+    baseFiltered.forEach((r) => { t[r.ageBucket]++; });
+    return t;
+  }, [baseFiltered]);
+  const segFiltered = useMemo(() => baseFiltered.filter((r) => r.ageBucket === ageSeg), [baseFiltered, ageSeg]);
+
+  const counts = useMemo(() => {
+    const c = { nocontact: 0, attempted: 0, contacted: 0, mine: 0 };
+    segFiltered.forEach((r) => { c[r.category]++; if (claimOf(r.leads_id)?.by === me?.email) c.mine++; });
+    return c;
+  }, [segFiltered, claims, now, me?.email]);
+
+  const rows = useMemo(() => {
+    let list = segFiltered.filter((r) => {
+      if (tab === "mine") return claimOf(r.leads_id)?.by === me?.email;
+      return r.category === tab;
     });
     const cmp = {
       newest: (a, b) => b.lead_date_in.localeCompare(a.lead_date_in),
@@ -470,13 +482,42 @@ export default function AppointmentSetterBoard() {
       stale: (a, b) => (b.hoursSinceTouch ?? 0) - (a.hoursSinceTouch ?? 0),
     }[sort];
     return [...list].sort(cmp);
-  }, [segEligible, tab, teamF, branchF, repF, touchWin, leadWin, q, sort, claims, now, me?.email]);
+  }, [segFiltered, tab, sort, claims, now, me?.email]);
 
   useEffect(() => setPage(0), [tab, teamF, branchF, repF, touchWin, leadWin, q, sort, ageSeg]);
   useEffect(() => setSel(new Set()), [tab, teamF, branchF, repF, touchWin, leadWin, q, sort, ageSeg, page]);
   const pages = Math.max(1, Math.ceil(rows.length / PAGE));
-  const pageRows = rows.slice(page * PAGE, page * PAGE + PAGE);
+  const pageRows = showAll ? rows : rows.slice(page * PAGE, page * PAGE + PAGE);
   const toggleSel = (id) => setSel((s) => { const n = new Set(s); n.has(id) ? n.delete(id) : n.add(id); return n; });
+
+  const exportCSV = () => {
+    const catLabel = { nocontact: "No contact", attempted: "Attempted · no success", contacted: "Contacted · no appt" };
+    const cols = [
+      ["Lead ID", (r) => r.leads_id],
+      ["Customer", (r) => r.account_name],
+      ["Rep", (r) => r.repName],
+      ["Team", (r) => r.team],
+      ["Branch", (r) => r.branch],
+      ["Milestone", (r) => r.milestone],
+      ["Touches", (r) => r.touches],
+      ["Time since last touch", (r) => fmtDur(r.hoursSinceTouch != null ? now - r.lastTouchMs : null)],
+      ["Lead in", (r) => r.lead_date_in],
+      ["Category", (r) => catLabel[r.category] || r.category],
+      ["Claimed by", (r) => claimOf(r.leads_id)?.byName || ""],
+      ["Last comment", (r) => r.lastLine?.text || ""],
+    ];
+    const esc = (v) => `"${String(v ?? "").replace(/\r?\n/g, " ").replace(/"/g, '""')}"`;
+    const csv = [cols.map((c) => esc(c[0])).join(",")]
+      .concat(rows.map((r) => cols.map((c) => esc(c[1](r))).join(",")))
+      .join("\r\n");
+    const blob = new Blob(["\ufeff" + csv], { type: "text/csv;charset=utf-8;" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `appointment-board-${tab}-${new Date().toISOString().slice(0, 10)}.csv`;
+    document.body.appendChild(a); a.click(); a.remove();
+    URL.revokeObjectURL(url);
+  };
 
   if (access === "resolving") {
     return (
@@ -565,7 +606,7 @@ export default function AppointmentSetterBoard() {
       <div className="asb-controls">
         <div className="asb-search">
           <Search size={14} />
-          <input placeholder="Search name, rep, or lead ID" value={q} onChange={(e) => setQ(e.target.value)} />
+          <input placeholder="Search name, rep, lead ID, or comments" value={q} onChange={(e) => setQ(e.target.value)} />
         </div>
         <Seg label="Team" value={teamF} onChange={setTeamF} opts={[["all", "All"], ["Field", "Field"], ["NST", "NST"]]} />
         <Pick label="Branch" value={branchF} onChange={setBranchF} opts={[["all", "All branches"], ...branches.map((b) => [b, b])]} />
@@ -709,11 +750,24 @@ export default function AppointmentSetterBoard() {
 
       {/* Pagination */}
       <div className="asb-foot">
-        <span>{rows.length} record{rows.length !== 1 ? "s" : ""}</span>
-        <div className="asb-pager">
-          <button disabled={page === 0} onClick={() => setPage((p) => p - 1)}><ChevronLeft size={14} /></button>
-          <span>{page + 1} / {pages}</span>
-          <button disabled={page >= pages - 1} onClick={() => setPage((p) => p + 1)}><ChevronRight size={14} /></button>
+        <span>
+          {rows.length} record{rows.length !== 1 ? "s" : ""}
+          {showAll && rows.length > 0 ? " (showing all)" : ""}
+        </span>
+        <div className="asb-foot-actions">
+          <button className="asb-foot-btn" onClick={exportCSV} disabled={rows.length === 0} title="Download the current section as CSV">
+            <Download size={13} /> Export CSV
+          </button>
+          <button className="asb-foot-btn" onClick={() => setShowAll((s) => !s)}>
+            {showAll ? "Paginate" : "Show all"}
+          </button>
+          {!showAll && (
+            <div className="asb-pager">
+              <button disabled={page === 0} onClick={() => setPage((p) => p - 1)}><ChevronLeft size={14} /></button>
+              <span>{page + 1} / {pages}</span>
+              <button disabled={page >= pages - 1} onClick={() => setPage((p) => p + 1)}><ChevronRight size={14} /></button>
+            </div>
+          )}
         </div>
       </div>
       </>
@@ -854,6 +908,10 @@ const CSS = `
 
 .asb-empty{padding:40px;text-align:center;color:var(--muted);}
 .asb-foot{display:flex;justify-content:space-between;align-items:center;margin-top:12px;color:var(--muted);font-size:12px;}
+.asb-foot-actions{display:flex;align-items:center;gap:10px;}
+.asb-foot-btn{display:flex;align-items:center;gap:6px;border:1px solid var(--line);background:#fff;border-radius:8px;padding:6px 11px;font:inherit;font-size:12px;color:var(--slate);cursor:pointer;}
+.asb-foot-btn:hover:not(:disabled){border-color:var(--indigo);color:var(--indigo);}
+.asb-foot-btn:disabled{opacity:.45;cursor:default;}
 .asb-pager{display:flex;align-items:center;gap:10px;}
 .asb-pager button{border:1px solid var(--line);background:#fff;border-radius:7px;padding:5px 8px;cursor:pointer;color:var(--slate);display:flex;}
 .asb-pager button:disabled{opacity:.4;cursor:default;}
