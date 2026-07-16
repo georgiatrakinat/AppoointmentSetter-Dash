@@ -279,7 +279,7 @@ const TABS = [
   { id: "nocontact", label: "No contact",
     desc: "Nobody has logged any activity on this lead yet — no dials, no emails, no comments. Fresh territory: you're the first touch." },
   { id: "attempted", label: "Attempted · no success",
-    desc: "Someone has tried to reach this customer (dialed, emailed, texted, or left a message) but there's no sign anyone actually spoke with them. Best odds for a set — keep working the phone." },
+    desc: "Someone has tried to reach this customer (dialed, emailed, texted, or left a message) but there's no sign anyone actually spoke with them. Best odds for appt — keep working the phone." },
   { id: "contacted", label: "Contacted · no appt",
     desc: "A real conversation happened — detected from a 'Contacted' marker, a contact date, or notes describing a live conversation — but no appointment was ever booked. Re-engage these." },
   { id: "mine", label: "My queue",
