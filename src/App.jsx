@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useMemo, useRef } from "react";
 import {
   Lock, Unlock, Phone, Mail, Clock, ExternalLink, Search,
-  ChevronLeft, ChevronRight, RefreshCw, Shield, User, MessageSquare, Download
+  ChevronLeft, ChevronRight, RefreshCw, Shield, User, MessageSquare, Download, Info
 } from "lucide-react";
 
 /* =========================================================================
@@ -276,11 +276,17 @@ const fmtClock = (ms) => {
 };
 
 const TABS = [
-  { id: "nocontact", label: "No contact" },
-  { id: "attempted", label: "Attempted · no success" },
-  { id: "contacted", label: "Contacted · no appt" },
-  { id: "mine", label: "My queue" },
+  { id: "nocontact", label: "No contact",
+    desc: "Nobody has logged any activity on this lead yet — no dials, no emails, no comments. Fresh territory: you're the first touch." },
+  { id: "attempted", label: "Attempted · no success",
+    desc: "Someone has tried to reach this customer (dialed, emailed, texted, or left a message) but there's no sign anyone actually spoke with them. Best odds for a set — keep working the phone." },
+  { id: "contacted", label: "Contacted · no appt",
+    desc: "A real conversation happened — detected from a 'Contacted' marker, a contact date, or notes describing a live conversation — but no appointment was ever booked. Re-engage these." },
+  { id: "mine", label: "My queue",
+    desc: "Leads you've claimed. They stay yours until you release them, so no one else will work them in the meantime." },
 ];
+
+const POOL_NOTE = "This board shows residential leads the assigned field rep didn't reach within the first hour. Already excluded: booked/quoted leads (Set Appt or any later milestone), lost sales, sLeads, releads, prospects, existing customers, EM Duggan, and Yelp/brand/corporate placeholder records.";
 
 function FieldDiag({ records }) {
   const [open, setOpen] = useState(false);
@@ -430,17 +436,26 @@ export default function AppointmentSetterBoard() {
     [eligible]
   );
 
-  // Time-window filter: hours-old vs selected bucket. null age never matches a bounded window.
+  // Time-window filter: "older than" thresholds — surfaces leads going stale.
+  // null age never matches a bounded window.
   const inWindow = (hrs, win) => {
     if (win === "any") return true;
     if (hrs == null) return false;
-    if (win === "24h") return hrs <= 24;
-    if (win === "3d") return hrs <= 72;
-    if (win === "7d") return hrs <= 168;
-    if (win === "older") return hrs > 168;
+    if (win === "24h") return hrs > 24;
+    if (win === "3d") return hrs > 72;
+    if (win === "7d") return hrs > 168;
+    if (win === "14d") return hrs > 336;
+    if (win === "30d") return hrs > 720;
     return true;
   };
-  const WIN_OPTS = [["any", "Any time"], ["24h", "≤ 24 hrs"], ["3d", "≤ 3 days"], ["7d", "≤ 7 days"], ["older", "Older (7d+)"]];
+  const WIN_OPTS = [
+    ["any", "Any time"],
+    ["24h", "> 24 hrs"],
+    ["3d", "> 3 days"],
+    ["7d", "> 7 days"],
+    ["14d", "> 14 days"],
+    ["30d", "> 30 days"],
+  ];
 
   // All row-level filters EXCEPT the age segment and the category tab. Counts derive
   // from this so the tab totals (and age-segment totals) reflect the active filters.
@@ -633,9 +648,20 @@ export default function AppointmentSetterBoard() {
         {TABS.map((t) => (
           <button key={t.id} className={`asb-tab ${tab === t.id ? "on" : ""}`} onClick={() => setTab(t.id)}>
             {t.label}<span className="asb-count">{counts[t.id]}</span>
+            <span className="asb-info" onClick={(e) => e.stopPropagation()}>
+              <Info size={12} />
+              <span className="asb-tip">{t.desc}</span>
+            </span>
           </button>
         ))}
       </nav>
+
+      {/* Active category description + what the pool excludes */}
+      <div className="asb-desc">
+        <b>{TABS.find((t) => t.id === tab)?.label}:</b>{" "}
+        {TABS.find((t) => t.id === tab)?.desc}
+        <span className="asb-pool" title={POOL_NOTE}><Info size={11} /> What's in this pool?</span>
+      </div>
 
       {/* Admin bulk-assign */}
       {isAdmin && sel.size > 0 && (
@@ -855,6 +881,13 @@ const CSS = `
 .asb-tab.on{color:var(--ink);border-bottom-color:var(--indigo);}
 .asb-count{background:#eef1f6;color:var(--slate);border-radius:20px;padding:1px 8px;font-size:11px;}
 .asb-tab.on .asb-count{background:var(--indigo);color:#fff;}
+.asb-info{position:relative;display:inline-flex;align-items:center;color:var(--muted);cursor:help;}
+.asb-info:hover{color:var(--indigo);}
+.asb-tip{display:none;position:absolute;top:calc(100% + 8px);left:50%;transform:translateX(-50%);width:270px;background:var(--ink);color:#fff;border-radius:9px;padding:9px 11px;font-size:11.5px;font-weight:450;line-height:1.5;letter-spacing:0;text-transform:none;z-index:60;box-shadow:0 8px 24px rgba(17,23,34,.25);white-space:normal;text-align:left;}
+.asb-info:hover .asb-tip{display:block;}
+.asb-desc{display:flex;align-items:center;gap:10px;flex-wrap:wrap;background:#fff;border:1px solid var(--line);border-radius:9px;padding:9px 13px;margin-top:10px;font-size:12px;color:var(--slate);line-height:1.5;}
+.asb-desc b{color:var(--ink);}
+.asb-pool{display:inline-flex;align-items:center;gap:4px;color:var(--indigo);cursor:help;font-weight:560;white-space:nowrap;margin-left:auto;}
 
 .asb-table{background:var(--surface);border:1px solid var(--line);border-radius:12px;overflow-x:auto;margin-top:10px;}
 .asb-tr{display:grid;grid-template-columns:116px 1.1fr 72px 1.15fr .8fr 62px 116px 1.6fr 80px 74px;gap:12px;align-items:center;padding:11px 14px;border-bottom:1px solid var(--line);min-width:1060px;}
