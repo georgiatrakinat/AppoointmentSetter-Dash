@@ -336,7 +336,9 @@ export default function AppointmentSetterBoard() {
   const [repF, setRepF] = useState("all");
   const [touchWin, setTouchWin] = useState("any");
   const [leadWin, setLeadWin] = useState("any");
-  const [sort, setSort] = useState("newest");
+  const [sortKey, setSortKey] = useState("leadin"); // leadin | touches | since
+  const [sortDir, setSortDir] = useState("desc");
+  const [claimedByF, setClaimedByF] = useState("all"); // admin: filter by who claimed
   const [ageSeg, setAgeSeg] = useState("aged"); // aged (>1h) | fresh (<1h)
   const [sel, setSel] = useState(() => new Set()); // admin multi-select
   const [assignTo, setAssignTo] = useState("");
@@ -468,9 +470,13 @@ export default function AppointmentSetterBoard() {
       if (!inWindow(r.hoursSinceTouch, touchWin)) return false;
       if (!inWindow((now - r.leadInMs) / 3.6e6, leadWin)) return false;
       if (qlc && !r.searchBlob.includes(qlc)) return false;
+      if (claimedByF !== "all") {
+        const c = claims[r.leads_id];
+        if (claimedByF === "unclaimed" ? !!c : c?.by !== claimedByF) return false;
+      }
       return true;
     });
-  }, [eligible, teamF, branchF, repF, touchWin, leadWin, q, now]);
+  }, [eligible, teamF, branchF, repF, touchWin, leadWin, q, now, claimedByF, claims]);
 
   const ageTotals = useMemo(() => {
     const t = { fresh: 0, aged: 0 };
@@ -485,22 +491,47 @@ export default function AppointmentSetterBoard() {
     return c;
   }, [segFiltered, claims, now, me?.email]);
 
+  const claimSummary = useMemo(() => {
+    const by = new Map();
+    eligible.forEach((r) => {
+      const c = claims[r.leads_id];
+      if (!c) return;
+      const e = by.get(c.by) || { name: c.byName, initials: c.initials, n: 0 };
+      e.n++; by.set(c.by, e);
+    });
+    return [...by.entries()].map(([email, v]) => ({ email, ...v })).sort((a, b) => b.n - a.n);
+  }, [eligible, claims]);
+
   const rows = useMemo(() => {
     let list = segFiltered.filter((r) => {
       if (tab === "mine") return claimOf(r.leads_id)?.by === me?.email;
       return r.category === tab;
     });
-    const cmp = {
-      newest: (a, b) => b.lead_date_in.localeCompare(a.lead_date_in),
-      oldest: (a, b) => a.lead_date_in.localeCompare(b.lead_date_in),
-      touches: (a, b) => b.touches - a.touches,
-      stale: (a, b) => (b.hoursSinceTouch ?? 0) - (a.hoursSinceTouch ?? 0),
-    }[sort];
+    // Click-to-sort columns. Nulls always sink to the bottom regardless of direction.
+    const val = {
+      touches: (r) => r.touches,
+      since: (r) => r.hoursSinceTouch,
+      leadin: (r) => r.leadInMs,
+    }[sortKey];
+    const dir = sortDir === "desc" ? 1 : -1;
+    const cmp = (a, b) => {
+      const av = val(a), bv = val(b);
+      if (av == null && bv == null) return 0;
+      if (av == null) return 1;
+      if (bv == null) return -1;
+      return (bv - av) * dir;
+    };
     return [...list].sort(cmp);
-  }, [segFiltered, tab, sort, claims, now, me?.email]);
+  }, [segFiltered, tab, sortKey, sortDir, claims, now, me?.email]);
 
-  useEffect(() => setPage(0), [tab, teamF, branchF, repF, touchWin, leadWin, q, sort, ageSeg]);
-  useEffect(() => setSel(new Set()), [tab, teamF, branchF, repF, touchWin, leadWin, q, sort, ageSeg, page]);
+  const toggleSort = (key) => {
+    if (key === sortKey) setSortDir((d) => (d === "desc" ? "asc" : "desc"));
+    else { setSortKey(key); setSortDir("desc"); }
+  };
+  const sortArrow = (key) => (key === sortKey ? (sortDir === "desc" ? " ↓" : " ↑") : "");
+
+  useEffect(() => setPage(0), [tab, teamF, branchF, repF, touchWin, leadWin, q, sortKey, sortDir, ageSeg, claimedByF]);
+  useEffect(() => setSel(new Set()), [tab, teamF, branchF, repF, touchWin, leadWin, q, sortKey, sortDir, ageSeg, claimedByF, page]);
   const pages = Math.max(1, Math.ceil(rows.length / PAGE));
   const pageRows = showAll ? rows : rows.slice(page * PAGE, page * PAGE + PAGE);
   const toggleSel = (id) => setSel((s) => { const n = new Set(s); n.has(id) ? n.delete(id) : n.add(id); return n; });
@@ -628,10 +659,28 @@ export default function AppointmentSetterBoard() {
         <Pick label="Rep" value={repF} onChange={setRepF} opts={[["all", "All reps"], ...reps.map((r) => [r, r])]} />
         <Pick label="Since touch" value={touchWin} onChange={setTouchWin} opts={WIN_OPTS} />
         <Pick label="Lead in" value={leadWin} onChange={setLeadWin} opts={WIN_OPTS} />
-        <Pick label="Sort" value={sort} onChange={setSort} opts={[["newest", "Newest lead in"], ["oldest", "Oldest lead in"], ["touches", "Most touches"], ["stale", "Longest since touch"]]} />
+        {isAdmin && (
+          <Pick label="Claimed by" value={claimedByF} onChange={setClaimedByF}
+            opts={[["all", "Anyone"], ["unclaimed", "Unclaimed"],
+              ...Object.entries(ACCESS_MAP).filter(([, u]) => u.role === "setter").map(([em, u]) => [em, u.name])]} />
+        )}
       </div>
 
       {isAdmin && <FieldDiag records={records} />}
+
+      {/* Admin: who has claimed what */}
+      {isAdmin && claimSummary.length > 0 && (
+        <div className="asb-claimsum">
+          <span className="asb-claimsum-lbl"><Shield size={12} /> Claimed right now</span>
+          {claimSummary.map((c) => (
+            <button key={c.email} className={`asb-claimsum-pill ${claimedByF === c.email ? "on" : ""}`}
+              onClick={() => setClaimedByF(claimedByF === c.email ? "all" : c.email)}
+              title={`Show only ${c.name}'s claimed opps`}>
+              <span className="asb-av">{c.initials}</span>{c.name}<b>{c.n}</b>
+            </button>
+          ))}
+        </div>
+      )}
 
       {/* Age segment — field rep gets the first hour; team works the older pool */}
       <div className="asb-age">
@@ -690,10 +739,10 @@ export default function AppointmentSetterBoard() {
           <div className="c-lid">Lead ID</div>
           <div className="c-rep">Rep · Branch</div>
           <div className="c-ms">Milestone</div>
-          <div className="c-num">Touches</div>
-          <div className="c-num">Time since last touch</div>
+          <div className={`c-num asb-sortable ${sortKey === "touches" ? "on" : ""}`} onClick={() => toggleSort("touches")} title="Click to sort">Touches{sortArrow("touches")}</div>
+          <div className={`c-num asb-sortable ${sortKey === "since" ? "on" : ""}`} onClick={() => toggleSort("since")} title="Click to sort">Time since last touch{sortArrow("since")}</div>
           <div className="c-cmt">Last comment</div>
-          <div className="c-date">Lead in</div>
+          <div className={`c-date asb-sortable ${sortKey === "leadin" ? "on" : ""}`} onClick={() => toggleSort("leadin")} title="Click to sort">Lead in{sortArrow("leadin")}</div>
           <div className="c-act"></div>
         </div>
 
@@ -802,9 +851,9 @@ export default function AppointmentSetterBoard() {
       {/* Comment hover panel */}
       {hover && (
         <div className="asb-pop" style={{ left: Math.min(hover.x + 16, window.innerWidth - 440), top: Math.min(hover.y + 12, window.innerHeight - 320) }}>
-          <div className="asb-pop-head">{hover.rec.account_name} · #{hover.rec.leads_id} · {hover.rec.lines.length} entries</div>
+          <div className="asb-pop-head">{hover.rec.account_name} · #{hover.rec.leads_id} · {hover.rec.lines.length} entries · newest first</div>
           <div className="asb-pop-body">
-            {hover.rec.lines.map((l, i) => (
+            {[...hover.rec.lines].reverse().map((l, i) => (
               <div className="asb-pop-line" key={i}>
                 {l.ts && <span className="asb-pop-ts">{l.ts}</span>}
                 {l.who && <span className="asb-pop-who">{l.who}</span>}
@@ -894,6 +943,16 @@ const CSS = `
 .asb-table.asb-admin .asb-tr{grid-template-columns:30px 116px 1.1fr 72px 1.15fr .8fr 62px 116px 1.6fr 80px 74px;min-width:1100px;}
 .asb-tr:last-child{border-bottom:none;}
 .asb-th{background:#fafbfc;color:var(--muted);font-size:10.5px;text-transform:uppercase;letter-spacing:.05em;font-weight:620;padding-top:9px;padding-bottom:9px;}
+.asb-sortable{cursor:pointer;user-select:none;}
+.asb-sortable:hover{color:var(--indigo);}
+.asb-sortable.on{color:var(--indigo);}
+.asb-claimsum{display:flex;align-items:center;gap:8px;flex-wrap:wrap;background:#fff;border:1px solid var(--line);border-radius:10px;padding:9px 13px;margin-top:10px;}
+.asb-claimsum-lbl{display:inline-flex;align-items:center;gap:5px;font-size:10.5px;text-transform:uppercase;letter-spacing:.04em;font-weight:680;color:var(--muted);}
+.asb-claimsum-pill{display:inline-flex;align-items:center;gap:6px;background:#f7f8fa;border:1px solid var(--line);border-radius:20px;padding:4px 10px 4px 4px;font:inherit;font-size:12px;color:var(--slate);cursor:pointer;}
+.asb-claimsum-pill .asb-av{width:20px;height:20px;border-radius:50%;background:var(--slate);color:#fff;font-size:9.5px;font-weight:680;display:inline-flex;align-items:center;justify-content:center;}
+.asb-claimsum-pill b{font-family:ui-monospace,Menlo,monospace;color:var(--ink);}
+.asb-claimsum-pill.on{border-color:var(--indigo);background:#eef2ff;color:var(--indigo);}
+.asb-claimsum-pill.on .asb-av{background:var(--indigo);}
 .asb-tr.is-mine{background:#f6f5ff;}
 .asb-tr.is-locked{background:#fbfbfc;}
 .asb-tr.is-sel{background:#eff6ff;}
