@@ -328,7 +328,8 @@ export default function AppointmentSetterBoard() {
   const [me, setMe] = useState(null); // {email, name, initials, role}
   const [access, setAccess] = useState("resolving"); // resolving | ok | blocked | devpick
   const [signedEmail, setSignedEmail] = useState("");
-  const [claims, setClaims] = useState({}); // PROD: loadClaims() from shared store
+  const [claims, setClaims] = useState({}); // shared claim store (via /api/claims)
+  const [apiOn, setApiOn] = useState(null); // null unknown | true (API live) | false (local fallback)
   const [tab, setTab] = useState("nocontact");
   const [q, setQ] = useState("");
   const [teamF, setTeamF] = useState("all");
@@ -405,14 +406,63 @@ export default function AppointmentSetterBoard() {
     return () => clearInterval(t);
   }, []);
 
+  // ---- Shared claim store (Azure Function + Table Storage at /api/claims) ----
+  // Falls back to in-session state when the API isn't present (preview / local dev).
+  const CLAIMS_API = "/api/claims";
+  const loadClaims = async () => {
+    try {
+      const r = await fetch(CLAIMS_API, { headers: { "cache-control": "no-cache" } });
+      if (!r.ok) throw new Error("no api");
+      const data = await r.json();
+      setClaims(data || {});
+      setApiOn(true);
+    } catch {
+      setApiOn((v) => (v === true ? true : false)); // stay in local mode
+    }
+  };
+  useEffect(() => { loadClaims(); }, []);
+  useEffect(() => {
+    if (apiOn !== true) return;
+    const t = setInterval(loadClaims, 20000); // near-real-time cross-user sync
+    return () => clearInterval(t);
+  }, [apiOn]);
+
   const claimOf = (id) => claims[id] || null; // claims persist until released
   const canClaim = me && (me.role === "setter" || me.role === "admin");
-  const saveClaim = (id, claim) => setClaims((p) => ({ ...p, [id]: claim })); // PROD: POST to shared store
-  const claimFor = (user) => ({ by: user.email, byName: user.name, initials: user.initials, at: now });
-  const doClaim = (id) => { if (canClaim) saveClaim(id, claimFor(me)); };
-  const doRelease = (id) => setClaims((p) => { const n = { ...p }; delete n[id]; return n; });
-  const assignMany = (ids, user) =>
-    setClaims((p) => { const n = { ...p }; ids.forEach((id) => { n[id] = claimFor(user); }); return n; });
+  const claimFor = (user) => ({ by: user.email, byName: user.name, initials: user.initials, at: Date.now() });
+
+  const doClaim = async (id) => {
+    if (!canClaim) return;
+    const claim = claimFor(me);
+    setClaims((p) => ({ ...p, [id]: claim })); // optimistic
+    if (apiOn) {
+      try {
+        const r = await fetch(CLAIMS_API, {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ leadId: id, ...claim, force: false }),
+        });
+        const data = await r.json();
+        if (data?.claims) setClaims((p) => ({ ...p, ...data.claims })); // reflects a conflicting owner
+      } catch { /* keep optimistic */ }
+    }
+  };
+  const doRelease = async (id) => {
+    setClaims((p) => { const n = { ...p }; delete n[id]; return n; });
+    if (apiOn) { try { await fetch(`${CLAIMS_API}/${id}`, { method: "DELETE" }); } catch {} }
+  };
+  const assignMany = async (ids, user) => {
+    const c = claimFor(user);
+    setClaims((p) => { const n = { ...p }; ids.forEach((id) => { n[id] = c; }); return n; });
+    if (apiOn) {
+      try {
+        await fetch(CLAIMS_API, {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ assignments: ids.map((id) => ({ leadId: id, ...c })), force: true }),
+        });
+        loadClaims();
+      } catch {}
+    }
+  };
 
   // enrich + eligibility filter
   const eligible = useMemo(() => {
@@ -644,6 +694,12 @@ export default function AppointmentSetterBoard() {
               <span>{me?.name}</span>
               <span className="asb-role">{me?.role}</span>
             </div>
+          )}
+          {apiOn === false && (
+            <span className="asb-sync local" title="Claims are local to this browser — the shared store isn't reachable">● local</span>
+          )}
+          {apiOn === true && (
+            <span className="asb-sync live" title="Claims are shared across the team in real time">● synced</span>
           )}
         </div>
       </header>
@@ -943,6 +999,9 @@ const CSS = `
 .asb-user select{border:none;background:none;font:inherit;color:var(--ink);outline:none;cursor:pointer;}
 .asb-signed{display:flex;align-items:center;gap:6px;background:var(--surface);border:1px solid var(--line);border-radius:8px;padding:6px 11px;color:var(--ink);font-size:12px;font-weight:560;}
 .asb-signed .asb-role{font-size:9.5px;text-transform:uppercase;letter-spacing:.04em;background:#eef1f6;color:var(--slate);border-radius:5px;padding:1px 6px;font-weight:680;}
+.asb-sync{font-size:11px;font-weight:560;display:inline-flex;align-items:center;padding:5px 9px;border-radius:8px;border:1px solid var(--line);}
+.asb-sync.live{color:var(--teal);background:#f0fdfa;border-color:#ccf0ea;}
+.asb-sync.local{color:var(--amber);background:#fff7ed;border-color:#fde8cf;}
 .asb-open{font-size:11px;color:var(--muted);font-style:italic;}
 
 .asb-controls{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:14px;}
