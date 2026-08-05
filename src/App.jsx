@@ -491,16 +491,37 @@ export default function AppointmentSetterBoard() {
     return c;
   }, [segFiltered, claims, now, me?.email]);
 
-  const claimSummary = useMemo(() => {
-    const by = new Map();
-    eligible.forEach((r) => {
-      const c = claims[r.leads_id];
-      if (!c) return;
-      const e = by.get(c.by) || { name: c.byName, initials: c.initials, n: 0 };
-      e.n++; by.set(c.by, e);
+  // Admin setter-queue analytics. Computed from the RAW feed (not `eligible`) joined
+  // to claims, so opps that had an appointment set — which leave the working board —
+  // are still counted. "Setter touch" = a comment authored by the assigned setter.
+  const recById = useMemo(() => {
+    const m = new Map();
+    (records || []).forEach((r) => m.set(String(r.leads_id), r));
+    return m;
+  }, [records]);
+
+  const setterTouched = (rec, setterName) => {
+    const key = repKey(setterName);
+    return parseComments(rec.comments).lines.some((l) => l.who && repKey(l.who) === key);
+  };
+  const hasApptSet = (rec) =>
+    isVal(rec["Set Appt"]) || isVal(rec["Appt. Completed"]) || isVal(rec["CDR Appt. Done"]);
+
+  const setterQueues = useMemo(() => {
+    const map = new Map();
+    Object.entries(claims).forEach(([leadId, c]) => {
+      const rec = recById.get(String(leadId));
+      const e = map.get(c.by) || { name: c.byName, initials: c.initials, total: 0, touched: 0, apptSet: 0 };
+      e.total++;
+      if (rec) {
+        if (hasApptSet(rec)) e.apptSet++;
+        if (setterTouched(rec, c.byName)) e.touched++;
+      }
+      map.set(c.by, e);
     });
-    return [...by.entries()].map(([email, v]) => ({ email, ...v })).sort((a, b) => b.n - a.n);
-  }, [eligible, claims]);
+    return [...map.entries()].map(([email, v]) => ({ email, ...v })).sort((a, b) => b.total - a.total);
+  }, [claims, recById]);
+  const pct = (n, d) => (d ? Math.round((n / d) * 100) : 0) + "%";
 
   const rows = useMemo(() => {
     let list = segFiltered.filter((r) => {
@@ -668,17 +689,29 @@ export default function AppointmentSetterBoard() {
 
       {isAdmin && <FieldDiag records={records} />}
 
-      {/* Admin: who has claimed what */}
-      {isAdmin && claimSummary.length > 0 && (
-        <div className="asb-claimsum">
-          <span className="asb-claimsum-lbl"><Shield size={12} /> Claimed right now</span>
-          {claimSummary.map((c) => (
-            <button key={c.email} className={`asb-claimsum-pill ${claimedByF === c.email ? "on" : ""}`}
-              onClick={() => setClaimedByF(claimedByF === c.email ? "all" : c.email)}
-              title={`Show only ${c.name}'s claimed opps`}>
-              <span className="asb-av">{c.initials}</span>{c.name}<b>{c.n}</b>
-            </button>
-          ))}
+      {/* Admin: setter queue review */}
+      {isAdmin && setterQueues.length > 0 && (
+        <div className="asb-sq">
+          <div className="asb-sq-head">
+            <Shield size={12} /> Setter queues
+            <span>· assigned opps, how many the setter has touched, and how many have an appointment set</span>
+          </div>
+          <div className="asb-sq-table">
+            <div className="asb-sq-row asb-sq-th">
+              <div>Setter</div><div>Assigned</div><div>≥1 setter touch</div><div>Appt set</div>
+            </div>
+            {setterQueues.map((s) => (
+              <div key={s.email} className={`asb-sq-row ${claimedByF === s.email ? "on" : ""}`}
+                onClick={() => setClaimedByF(claimedByF === s.email ? "all" : s.email)}
+                title={`Filter the board to ${s.name}'s open opps`}>
+                <div className="asb-sq-name"><span className="asb-av">{s.initials}</span>{s.name}</div>
+                <div><b>{s.total}</b></div>
+                <div>{s.touched} <span className="asb-sq-pct">({pct(s.touched, s.total)})</span></div>
+                <div>{s.apptSet} <span className="asb-sq-pct">({pct(s.apptSet, s.total)})</span></div>
+              </div>
+            ))}
+          </div>
+          <div className="asb-sq-note">Assigned includes opps that already have an appointment set — those still count here but leave the working board below. Click a setter to filter the board to their open opps.</div>
         </div>
       )}
 
@@ -946,13 +979,22 @@ const CSS = `
 .asb-sortable{cursor:pointer;user-select:none;}
 .asb-sortable:hover{color:var(--indigo);}
 .asb-sortable.on{color:var(--indigo);}
-.asb-claimsum{display:flex;align-items:center;gap:8px;flex-wrap:wrap;background:#fff;border:1px solid var(--line);border-radius:10px;padding:9px 13px;margin-top:10px;}
-.asb-claimsum-lbl{display:inline-flex;align-items:center;gap:5px;font-size:10.5px;text-transform:uppercase;letter-spacing:.04em;font-weight:680;color:var(--muted);}
-.asb-claimsum-pill{display:inline-flex;align-items:center;gap:6px;background:#f7f8fa;border:1px solid var(--line);border-radius:20px;padding:4px 10px 4px 4px;font:inherit;font-size:12px;color:var(--slate);cursor:pointer;}
-.asb-claimsum-pill .asb-av{width:20px;height:20px;border-radius:50%;background:var(--slate);color:#fff;font-size:9.5px;font-weight:680;display:inline-flex;align-items:center;justify-content:center;}
-.asb-claimsum-pill b{font-family:ui-monospace,Menlo,monospace;color:var(--ink);}
-.asb-claimsum-pill.on{border-color:var(--indigo);background:#eef2ff;color:var(--indigo);}
-.asb-claimsum-pill.on .asb-av{background:var(--indigo);}
+.asb-sq{background:#fff;border:1px solid var(--line);border-radius:11px;padding:12px 14px;margin-top:10px;}
+.asb-sq-head{display:flex;align-items:center;gap:6px;font-size:11px;font-weight:680;text-transform:uppercase;letter-spacing:.04em;color:var(--indigo);margin-bottom:9px;}
+.asb-sq-head span{font-weight:450;text-transform:none;letter-spacing:0;color:var(--muted);font-size:11.5px;}
+.asb-sq-table{border:1px solid var(--line);border-radius:9px;overflow:hidden;}
+.asb-sq-row{display:grid;grid-template-columns:1.6fr .8fr 1fr 1fr;gap:10px;align-items:center;padding:8px 12px;border-bottom:1px solid var(--line);font-size:12.5px;cursor:pointer;}
+.asb-sq-row:last-child{border-bottom:none;}
+.asb-sq-row:not(.asb-sq-th):hover{background:#f7f8fa;}
+.asb-sq-row.on{background:#eef2ff;}
+.asb-sq-th{background:#fafbfc;font-size:10.5px;text-transform:uppercase;letter-spacing:.04em;font-weight:620;color:var(--muted);cursor:default;}
+.asb-sq-th:hover{background:#fafbfc;}
+.asb-sq-name{display:flex;align-items:center;gap:8px;font-weight:560;}
+.asb-sq-name .asb-av{width:22px;height:22px;border-radius:50%;background:var(--slate);color:#fff;font-size:9.5px;font-weight:680;display:inline-flex;align-items:center;justify-content:center;}
+.asb-sq-row.on .asb-sq-name .asb-av{background:var(--indigo);}
+.asb-sq-row b{font-family:ui-monospace,Menlo,monospace;}
+.asb-sq-pct{color:var(--muted);font-size:11px;}
+.asb-sq-note{font-size:11px;color:var(--muted);margin-top:8px;line-height:1.5;}
 .asb-tr.is-mine{background:#f6f5ff;}
 .asb-tr.is-locked{background:#fbfbfc;}
 .asb-tr.is-sel{background:#eff6ff;}
