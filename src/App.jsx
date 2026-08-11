@@ -56,6 +56,12 @@ const isJunkName = (r) => /\b(yelp|brand|corporate)\b/i.test(r.account_name || "
 // so failed attempts ("left message", "no answer", "disconnected") don't match.
 const CONTACTED_TEXT_RE = /\b(spoke|talked)\s+(to|with)\b|\b(customer|client|cust|he|she|they)\s+(said|says|mentioned|asked|answered)\b|\b(customer|client|cust)\s+(wants|needs|would\s+like|prefers|is\s+interested|is\s+looking|are\s+looking)\b|\banswered\s+the\s+(phone|call)\b|\bon\s+the\s+phone\s+with\b|\bpicked\s*up\b|\breached\s+(the\s+)?(customer|client|him|her|them)\b/i;
 
+// Reusable contacted check (structured marker, Contact column, or conversation text).
+const isContacted = (r) =>
+  /Dialed Contact:\s*Contacted/i.test(r.comments || "") ||
+  isVal(r.Contact) ||
+  CONTACTED_TEXT_RE.test(r.comments || "");
+
 // sLeads are tagged in account_type, e.g. "sLead / Relead". Match the sLead token.
 const isSLead = (r) => /\bs[-\s]?lead/i.test(String(r.account_type || ""));
 const isCommercial = (_r) => false;    // PROD: commercial field name still unconfirmed in feed
@@ -334,7 +340,7 @@ export default function AppointmentSetterBoard() {
   const [q, setQ] = useState("");
   const [teamF, setTeamF] = useState("all");
   const [branchF, setBranchF] = useState("all");
-  const [repF, setRepF] = useState("all");
+  const [repExcluded, setRepExcluded] = useState(() => new Set()); // empty = all reps shown
   const [touchWin, setTouchWin] = useState("any");
   const [leadWin, setLeadWin] = useState("any");
   const [sortKey, setSortKey] = useState("leadin"); // leadin | touches | since
@@ -516,7 +522,7 @@ export default function AppointmentSetterBoard() {
     return eligible.filter((r) => {
       if (teamF !== "all" && r.team !== teamF) return false;
       if (branchF !== "all" && r.branch !== branchF) return false;
-      if (repF !== "all" && r.repName !== repF) return false;
+      if (repExcluded.has(r.repName)) return false;
       if (!inWindow(r.hoursSinceTouch, touchWin)) return false;
       if (!inWindow((now - r.leadInMs) / 3.6e6, leadWin)) return false;
       if (qlc && !r.searchBlob.includes(qlc)) return false;
@@ -526,7 +532,7 @@ export default function AppointmentSetterBoard() {
       }
       return true;
     });
-  }, [eligible, teamF, branchF, repF, touchWin, leadWin, q, now, claimedByF, claims]);
+  }, [eligible, teamF, branchF, repExcluded, touchWin, leadWin, q, now, claimedByF, claims]);
 
   const ageTotals = useMemo(() => {
     const t = { fresh: 0, aged: 0 };
@@ -561,10 +567,11 @@ export default function AppointmentSetterBoard() {
     const map = new Map();
     Object.entries(claims).forEach(([leadId, c]) => {
       const rec = recById.get(String(leadId));
-      const e = map.get(c.by) || { name: c.byName, initials: c.initials, total: 0, touched: 0, apptSet: 0 };
+      const e = map.get(c.by) || { name: c.byName, initials: c.initials, total: 0, touched: 0, contactedNoAppt: 0, apptSet: 0 };
       e.total++;
       if (rec) {
         if (hasApptSet(rec)) e.apptSet++;
+        else if (isContacted(rec)) e.contactedNoAppt++;
         if (setterTouched(rec, c.byName)) e.touched++;
       }
       map.set(c.by, e);
@@ -572,6 +579,22 @@ export default function AppointmentSetterBoard() {
     return [...map.entries()].map(([email, v]) => ({ email, ...v })).sort((a, b) => b.total - a.total);
   }, [claims, recById]);
   const pct = (n, d) => (d ? Math.round((n / d) * 100) : 0) + "%";
+
+  // When one setter is selected, reconcile their Assigned total to what's on the board.
+  const selSetter = (claimedByF !== "all" && claimedByF !== "unclaimed") ? claimedByF : null;
+  const recon = useMemo(() => {
+    if (!selSetter) return null;
+    const ids = Object.entries(claims).filter(([, c]) => c.by === selSetter).map(([id]) => String(id));
+    const eligibleIds = new Set(eligible.map((r) => String(r.leads_id)));
+    let apptSet = 0, open = 0;
+    ids.forEach((id) => {
+      if (eligibleIds.has(id)) open++;
+      else if (recById.get(id) && hasApptSet(recById.get(id))) apptSet++;
+    });
+    const total = ids.length;
+    const name = setterQueues.find((s) => s.email === selSetter)?.name || selSetter;
+    return { name, total, open, apptSet, other: Math.max(0, total - open - apptSet) };
+  }, [selSetter, claims, eligible, recById, setterQueues]);
 
   const rows = useMemo(() => {
     let list = segFiltered.filter((r) => {
@@ -601,8 +624,8 @@ export default function AppointmentSetterBoard() {
   };
   const sortArrow = (key) => (key === sortKey ? (sortDir === "desc" ? " ↓" : " ↑") : "");
 
-  useEffect(() => setPage(0), [tab, teamF, branchF, repF, touchWin, leadWin, q, sortKey, sortDir, ageSeg, claimedByF]);
-  useEffect(() => setSel(new Set()), [tab, teamF, branchF, repF, touchWin, leadWin, q, sortKey, sortDir, ageSeg, claimedByF, page]);
+  useEffect(() => setPage(0), [tab, teamF, branchF, repExcluded, touchWin, leadWin, q, sortKey, sortDir, ageSeg, claimedByF]);
+  useEffect(() => setSel(new Set()), [tab, teamF, branchF, repExcluded, touchWin, leadWin, q, sortKey, sortDir, ageSeg, claimedByF, page]);
   const pages = Math.max(1, Math.ceil(rows.length / PAGE));
   const pageRows = showAll ? rows : rows.slice(page * PAGE, page * PAGE + PAGE);
   const toggleSel = (id) => setSel((s) => { const n = new Set(s); n.has(id) ? n.delete(id) : n.add(id); return n; });
@@ -733,14 +756,15 @@ export default function AppointmentSetterBoard() {
         </div>
         <Seg label="Team" value={teamF} onChange={setTeamF} opts={[["all", "All"], ["Field", "Field"], ["NST", "NST"]]} />
         <Pick label="Branch" value={branchF} onChange={setBranchF} opts={[["all", "All branches"], ...branches.map((b) => [b, b])]} />
-        <Pick label="Rep" value={repF} onChange={setRepF} opts={[["all", "All reps"], ...reps.map((r) => [r, r])]} />
+        <MultiSelect label="Rep" options={reps} excluded={repExcluded}
+          onToggle={(r) => setRepExcluded((s) => { const n = new Set(s); n.has(r) ? n.delete(r) : n.add(r); return n; })}
+          onAll={() => setRepExcluded(new Set())}
+          onNone={() => setRepExcluded(new Set(reps))} />
         <Pick label="Since touch" value={touchWin} onChange={setTouchWin} opts={WIN_OPTS} />
         <Pick label="Lead in" value={leadWin} onChange={setLeadWin} opts={WIN_OPTS} />
-        {isAdmin && (
-          <Pick label="Claimed by" value={claimedByF} onChange={setClaimedByF}
-            opts={[["all", "Anyone"], ["unclaimed", "Unclaimed"],
-              ...Object.entries(ACCESS_MAP).filter(([, u]) => u.role === "setter").map(([em, u]) => [em, u.name])]} />
-        )}
+        <Pick label="Claimed by" value={claimedByF} onChange={setClaimedByF}
+          opts={[["all", "Anyone"], ["unclaimed", "Unclaimed"],
+            ...Object.entries(ACCESS_MAP).map(([em, u]) => [em, u.role === "admin" ? `${u.name} (admin)` : u.name])]} />
       </div>
 
       {isAdmin && <FieldDiag records={records} />}
@@ -750,11 +774,11 @@ export default function AppointmentSetterBoard() {
         <div className="asb-sq">
           <div className="asb-sq-head">
             <Shield size={12} /> Setter queues
-            <span>· assigned opps, how many the setter has touched, and how many have an appointment set</span>
+            <span>· assigned opps, how many the setter has touched, how many are contacted with no appt yet, and how many have an appointment set</span>
           </div>
           <div className="asb-sq-table">
             <div className="asb-sq-row asb-sq-th">
-              <div>Setter</div><div>Assigned</div><div>≥1 setter touch</div><div>Appt set</div>
+              <div>Setter</div><div>Assigned</div><div>≥1 setter touch</div><div>Contacted · no appt</div><div>Appt set</div>
             </div>
             {setterQueues.map((s) => (
               <div key={s.email} className={`asb-sq-row ${claimedByF === s.email ? "on" : ""}`}
@@ -763,11 +787,23 @@ export default function AppointmentSetterBoard() {
                 <div className="asb-sq-name"><span className="asb-av">{s.initials}</span>{s.name}</div>
                 <div><b>{s.total}</b></div>
                 <div>{s.touched} <span className="asb-sq-pct">({pct(s.touched, s.total)})</span></div>
+                <div>{s.contactedNoAppt} <span className="asb-sq-pct">({pct(s.contactedNoAppt, s.total)})</span></div>
                 <div>{s.apptSet} <span className="asb-sq-pct">({pct(s.apptSet, s.total)})</span></div>
               </div>
             ))}
           </div>
           <div className="asb-sq-note">Assigned includes opps that already have an appointment set — those still count here but leave the working board below. Click a setter to filter the board to their open opps.</div>
+        </div>
+      )}
+
+      {/* Per-setter reconciliation: assigned = open + appt set + other */}
+      {recon && (
+        <div className="asb-recon">
+          <b>{recon.name}</b> · <b>{recon.total}</b> assigned ={" "}
+          <span className="asb-recon-open">{recon.open} open below</span> +{" "}
+          <span className="asb-recon-appt">{recon.apptSet} appt set</span>
+          {recon.other > 0 && <> + <span className="asb-recon-other">{recon.other} quoted / no longer eligible</span></>}
+          <button className="asb-recon-clear" onClick={() => setClaimedByF("all")}>clear</button>
         </div>
       )}
 
@@ -978,6 +1014,38 @@ function Pick({ label, value, onChange, opts }) {
     </label>
   );
 }
+function MultiSelect({ label, options, excluded, onToggle, onAll, onNone }) {
+  const [open, setOpen] = useState(false);
+  const selected = options.length - options.filter((o) => excluded.has(o)).length;
+  const allSel = selected === options.length;
+  return (
+    <div className="asb-ms-wrap">
+      <span className="asb-pick-lbl">{label}</span>
+      <button className="asb-ms-btn" onClick={() => setOpen((o) => !o)}>
+        {allSel ? "All" : `${selected} of ${options.length}`} <span className="asb-ms-caret">▾</span>
+      </button>
+      {open && (
+        <>
+          <div className="asb-ms-backdrop" onClick={() => setOpen(false)} />
+          <div className="asb-ms-menu">
+            <div className="asb-ms-actions">
+              <button onClick={onAll}>Select all</button>
+              <button onClick={onNone}>Clear all</button>
+            </div>
+            <div className="asb-ms-list">
+              {options.map((o) => (
+                <label key={o} className="asb-ms-opt">
+                  <input type="checkbox" checked={!excluded.has(o)} onChange={() => onToggle(o)} />
+                  {o}
+                </label>
+              ))}
+            </div>
+          </div>
+        </>
+      )}
+    </div>
+  );
+}
 
 const CSS = `
 .asb{--ink:#111722;--muted:#697586;--line:#e4e8ee;--surface:#fff;--bg:#f5f7fa;
@@ -1016,6 +1084,27 @@ const CSS = `
 .asb-pick{display:flex;align-items:center;gap:7px;color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.04em;}
 .asb-pick select{background:var(--surface);border:1px solid var(--line);border-radius:9px;padding:7px 10px;font:inherit;text-transform:none;letter-spacing:0;color:var(--ink);cursor:pointer;font-size:12px;}
 
+.asb-ms-wrap{position:relative;display:flex;align-items:center;gap:7px;}
+.asb-pick-lbl{color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.04em;}
+.asb-ms-btn{background:var(--surface);border:1px solid var(--line);border-radius:9px;padding:7px 11px;font:inherit;font-size:12px;color:var(--ink);cursor:pointer;display:flex;align-items:center;gap:6px;}
+.asb-ms-caret{color:var(--muted);font-size:10px;}
+.asb-ms-backdrop{position:fixed;inset:0;z-index:40;}
+.asb-ms-menu{position:absolute;top:calc(100% + 6px);left:0;z-index:41;background:#fff;border:1px solid var(--line);border-radius:10px;box-shadow:0 10px 30px rgba(17,23,34,.16);width:230px;padding:8px;}
+.asb-ms-actions{display:flex;gap:6px;padding-bottom:8px;margin-bottom:6px;border-bottom:1px solid var(--line);}
+.asb-ms-actions button{flex:1;background:#f5f7fa;border:1px solid var(--line);border-radius:7px;padding:5px;font:inherit;font-size:11px;color:var(--slate);cursor:pointer;}
+.asb-ms-actions button:hover{border-color:var(--indigo);color:var(--indigo);}
+.asb-ms-list{max-height:260px;overflow:auto;}
+.asb-ms-opt{display:flex;align-items:center;gap:8px;padding:5px 6px;font-size:12.5px;color:var(--ink);cursor:pointer;border-radius:6px;}
+.asb-ms-opt:hover{background:#f7f8fa;}
+.asb-ms-opt input{width:14px;height:14px;cursor:pointer;}
+
+.asb-recon{display:flex;align-items:center;gap:6px;flex-wrap:wrap;background:#eef2ff;border:1px solid #d6dcff;border-radius:9px;padding:9px 13px;margin-top:10px;font-size:12.5px;color:var(--slate);}
+.asb-recon b{color:var(--ink);}
+.asb-recon-open{color:var(--teal);font-weight:560;}
+.asb-recon-appt{color:var(--indigo);font-weight:560;}
+.asb-recon-other{color:var(--amber);font-weight:560;}
+.asb-recon-clear{margin-left:auto;background:none;border:none;color:var(--muted);font:inherit;font-size:12px;cursor:pointer;text-decoration:underline;}
+
 .asb-tabs{display:flex;gap:4px;border-bottom:1px solid var(--line);margin-bottom:2px;}
 .asb-tab{border:none;background:none;padding:10px 14px;font:inherit;font-weight:560;color:var(--muted);cursor:pointer;border-bottom:2px solid transparent;margin-bottom:-1px;display:flex;align-items:center;gap:8px;}
 .asb-tab:hover{color:var(--ink);}
@@ -1042,7 +1131,7 @@ const CSS = `
 .asb-sq-head{display:flex;align-items:center;gap:6px;font-size:11px;font-weight:680;text-transform:uppercase;letter-spacing:.04em;color:var(--indigo);margin-bottom:9px;}
 .asb-sq-head span{font-weight:450;text-transform:none;letter-spacing:0;color:var(--muted);font-size:11.5px;}
 .asb-sq-table{border:1px solid var(--line);border-radius:9px;overflow:hidden;}
-.asb-sq-row{display:grid;grid-template-columns:1.6fr .8fr 1fr 1fr;gap:10px;align-items:center;padding:8px 12px;border-bottom:1px solid var(--line);font-size:12.5px;cursor:pointer;}
+.asb-sq-row{display:grid;grid-template-columns:1.6fr .7fr 1fr 1.1fr .9fr;gap:10px;align-items:center;padding:8px 12px;border-bottom:1px solid var(--line);font-size:12.5px;cursor:pointer;}
 .asb-sq-row:last-child{border-bottom:none;}
 .asb-sq-row:not(.asb-sq-th):hover{background:#f7f8fa;}
 .asb-sq-row.on{background:#eef2ff;}
