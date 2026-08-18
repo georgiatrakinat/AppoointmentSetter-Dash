@@ -208,11 +208,18 @@ function deriveMilestone(r) {
   if (isVal(r.Dialed)) return "Dialed";
   return "New";
 }
-// Drop anything that has reached Set Appt or any later milestone (4-8 in the CRM:
-// Set Appt, Appt Completed, CDR Appt Done, Quote sent, Letter Sent).
-const pastApptStage = (r) =>
-  isVal(r["Set Appt"]) || isVal(r["Appt. Completed"]) || isVal(r["CDR Appt. Done"]) ||
-  isVal(r["Quote Sent"]) || isVal(r["Letter Sent"]);
+// Appointment set = a date in any of these three CRM fields, regardless of who set it.
+const hasApptSet = (r) =>
+  isVal(r["Set Appt"]) || isVal(r["Appt. Completed"]) || isVal(r["CDR Appt. Done"]);
+// Quoted / letter-sent but no appointment — still hidden from the board (further along, no appt).
+const quotedNoAppt = (r) =>
+  !hasApptSet(r) && (isVal(r["Quote Sent"]) || isVal(r["Letter Sent"]));
+// Who set the appointment — inferred from an appointment-setting comment's author.
+const APPT_SET_RE = /\bset\s+appt|\bset\s+appointment|\bappointment\s+set|\bappt\.?\s+set|\bbooked\s+(the\s+|an\s+)?appt|\bset\s+(an\s+|the\s+)?appointment/i;
+const apptSetByAuthor = (rec, personName) => {
+  const key = repKey(personName);
+  return parseComments(rec.comments).lines.some((l) => l.who && repKey(l.who) === key && APPT_SET_RE.test(l.text || ""));
+};
 const isLost = (r) =>
   r.status_id === 6 || /lost\s*sale/i.test(r.status || "") || LOST_RE.test(r.comments || "");
 const isResidential = (r) => String(r.professional).toLowerCase() !== "true" && !isCommercial(r);
@@ -225,9 +232,6 @@ function enrich(r, now) {
   const leadInMs = isVal(r.lead_created_time)
     ? Date.parse(String(r.lead_created_time).replace(" ", "T"))
     : firstMs;
-  const contacted = p.contacted || isVal(r.Contact) || CONTACTED_TEXT_RE.test(r.comments || "");
-  // Any commentary entry counts as a touch; never undercount below populated stage
-  // columns (Dialed/Email/Contact). Last touch = latest of last comment or stage date.
   const stageTouches = [r.Dialed, r["Email Sent"], r.Contact].filter(isVal).length;
   const commentEntries = p.lines.filter((l) => l.ts).length;
   const touches = Math.max(commentEntries, stageTouches);
@@ -236,8 +240,9 @@ function enrich(r, now) {
       .filter(isVal).map((d) => Date.parse(String(d).replace(" ", "T"))).filter((n) => !isNaN(n));
     return ds.length ? Math.max(...ds) : null;
   })();
-  let category = "nocontact";
-  if (contacted) category = "contacted";
+  // Three buckets: appointment made → contact attempted → no contact attempted.
+  let category = "noattempt";
+  if (hasApptSet(r)) category = "apptmade";
   else if (touches > 0) category = "attempted";
   // Roster lookup drives team + branch (name suffix alone is unreliable; see Richard Foronda).
   const ro = ROSTER[repKey(r.salesreps_name)];
@@ -251,7 +256,6 @@ function enrich(r, now) {
     team: teamVal,
     milestone: deriveMilestone(r),
     touches: touches,
-    contacted,
     lastAttemptBy: p.lastAttemptBy,
     lastAttemptTs: p.lastAttemptTs,
     lines: p.lines,
@@ -282,17 +286,17 @@ const fmtClock = (ms) => {
 };
 
 const TABS = [
-  { id: "nocontact", label: "No contact",
-    desc: "Nobody has logged any activity on this lead yet — no dials, no emails, no comments. Fresh territory: you're the first touch." },
-  { id: "attempted", label: "Attempted · no success",
-    desc: "Someone has tried to reach this customer (dialed, emailed, texted, or left a message) but there's no sign anyone actually spoke with them. Best odds for appt — keep working the phone." },
-  { id: "contacted", label: "Contacted · no appt",
-    desc: "A real conversation happened — detected from a 'Contacted' marker, a contact date, or notes describing a live conversation — but no appointment was ever booked. Re-engage these." },
+  { id: "noattempt", label: "No contact attempted",
+    desc: "No outreach has been logged yet — no dials, emails, texts, or comments. Fresh; you're the first attempt." },
+  { id: "attempted", label: "Contact attempted",
+    desc: "Outreach has been attempted (dialed, emailed, texted, or a note logged) but no appointment is set yet. The active working pile." },
+  { id: "apptmade", label: "Appointment made",
+    desc: "An appointment is set on this lead — a date in Set Appt, Appt Completed, or CDR Appt Done." },
   { id: "mine", label: "My queue",
-    desc: "Leads you've claimed. They stay yours until you release them, so no one else will work them in the meantime." },
+    desc: "Leads you've claimed. They stay yours until you release them, so no one else works them in the meantime." },
 ];
 
-const POOL_NOTE = "This board shows residential leads the assigned field rep didn't reach within the first hour. Already excluded: booked/quoted leads (Set Appt or any later milestone), lost sales, sLeads, releads, prospects, existing customers, EM Duggan, and Yelp/brand/corporate placeholder records.";
+const POOL_NOTE = "This board shows residential leads the assigned field rep didn't reach within the first hour. Already excluded: quoted/letter-sent leads with no appointment, lost sales, sLeads, releads, prospects, existing customers, EM Duggan, and Yelp/brand/corporate placeholder records.";
 
 function FieldDiag({ records }) {
   const [open, setOpen] = useState(false);
@@ -336,13 +340,14 @@ export default function AppointmentSetterBoard() {
   const [signedEmail, setSignedEmail] = useState("");
   const [claims, setClaims] = useState({}); // shared claim store (via /api/claims)
   const [apiOn, setApiOn] = useState(null); // null unknown | true (API live) | false (local fallback)
-  const [tab, setTab] = useState("nocontact");
+  const [tab, setTab] = useState("noattempt");
   const [q, setQ] = useState("");
   const [teamF, setTeamF] = useState("all");
   const [branchF, setBranchF] = useState("all");
   const [repExcluded, setRepExcluded] = useState(() => new Set()); // empty = all reps shown
   const [touchWin, setTouchWin] = useState("any");
   const [leadWin, setLeadWin] = useState("any");
+  const [assignWin, setAssignWin] = useState("any"); // admin: claim-date window
   const [sortKey, setSortKey] = useState("leadin"); // leadin | touches | since
   const [sortDir, setSortDir] = useState("desc");
   const [claimedByF, setClaimedByF] = useState("all"); // admin: filter by who claimed
@@ -477,7 +482,7 @@ export default function AppointmentSetterBoard() {
       if (isSLead(r)) return false;               // drop sLeads
       if (String(r.relead || "").trim().toLowerCase() === "y") return false; // drop releads
       if (isLost(r)) return false;                // drop lost
-      if (pastApptStage(r)) return false;         // drop Set Appt or any later milestone
+      if (quotedNoAppt(r)) return false;          // quoted/letter but no appt — still hidden
       if (isDuggan(r)) return false;              // drop EM Duggan partner channel
       if (isJunkName(r)) return false;            // drop Yelp / brand / corporate placeholder records
       if (EXCLUDED_ACCOUNT_CLASSES.includes(String(r.account_class || "").trim().toLowerCase())) return false; // drop prospects/customers
@@ -514,6 +519,36 @@ export default function AppointmentSetterBoard() {
     ["14d", "> 14 days"],
     ["30d", "> 30 days"],
   ];
+  // Lead-in supports both directions (fresh "within" and stale "older than").
+  const inLeadWindow = (hrs, win) => {
+    if (win === "any") return true;
+    if (hrs == null) return false;
+    const m = { w24h: ["<", 24], w3d: ["<", 72], w7d: ["<", 168], w14d: ["<", 336], o7d: [">", 168], o30d: [">", 720] }[win];
+    return m ? (m[0] === "<" ? hrs <= m[1] : hrs > m[1]) : true;
+  };
+  const LEAD_WIN_OPTS = [
+    ["any", "Any time"],
+    ["w24h", "Within 24 hrs"],
+    ["w3d", "Within 3 days"],
+    ["w7d", "Within 7 days"],
+    ["w14d", "Within 14 days"],
+    ["o7d", "Older than 7 days"],
+    ["o30d", "Older than 30 days"],
+  ];
+  const ASSIGN_WIN_OPTS = [
+    ["any", "Any time"],
+    ["24h", "Last 24 hrs"],
+    ["7d", "Last 7 days"],
+    ["30d", "Last 30 days"],
+    ["90d", "Last 90 days"],
+  ];
+  // Assignment-date window (by claim.at) — lets admins scope stats to a period.
+  const inAssignWin = (atMs) => {
+    if (assignWin === "any") return true;
+    if (!atMs) return false;
+    const days = { "24h": 1, "7d": 7, "30d": 30, "90d": 90 }[assignWin];
+    return (now - atMs) <= days * 24 * 3.6e6;
+  };
 
   // All row-level filters EXCEPT the age segment and the category tab. Counts derive
   // from this so the tab totals (and age-segment totals) reflect the active filters.
@@ -524,15 +559,16 @@ export default function AppointmentSetterBoard() {
       if (branchF !== "all" && r.branch !== branchF) return false;
       if (repExcluded.has(r.repName)) return false;
       if (!inWindow(r.hoursSinceTouch, touchWin)) return false;
-      if (!inWindow((now - r.leadInMs) / 3.6e6, leadWin)) return false;
+      if (!inLeadWindow((now - r.leadInMs) / 3.6e6, leadWin)) return false;
       if (qlc && !r.searchBlob.includes(qlc)) return false;
       if (claimedByF !== "all") {
         const c = claims[r.leads_id];
         if (claimedByF === "unclaimed" ? !!c : c?.by !== claimedByF) return false;
       }
+      if (assignWin !== "any") { const c = claims[r.leads_id]; if (c && !inAssignWin(c.at)) return false; }
       return true;
     });
-  }, [eligible, teamF, branchF, repExcluded, touchWin, leadWin, q, now, claimedByF, claims]);
+  }, [eligible, teamF, branchF, repExcluded, touchWin, leadWin, q, now, claimedByF, claims, assignWin]);
 
   const ageTotals = useMemo(() => {
     const t = { fresh: 0, aged: 0 };
@@ -542,7 +578,7 @@ export default function AppointmentSetterBoard() {
   const segFiltered = useMemo(() => baseFiltered.filter((r) => r.ageBucket === ageSeg), [baseFiltered, ageSeg]);
 
   const counts = useMemo(() => {
-    const c = { nocontact: 0, attempted: 0, contacted: 0, mine: 0 };
+    const c = { noattempt: 0, attempted: 0, apptmade: 0, mine: 0 };
     segFiltered.forEach((r) => { c[r.category]++; if (claimOf(r.leads_id)?.by === me?.email) c.mine++; });
     return c;
   }, [segFiltered, claims, now, me?.email]);
@@ -560,41 +596,40 @@ export default function AppointmentSetterBoard() {
     const key = repKey(setterName);
     return parseComments(rec.comments).lines.some((l) => l.who && repKey(l.who) === key);
   };
-  const hasApptSet = (rec) =>
-    isVal(rec["Set Appt"]) || isVal(rec["Appt. Completed"]) || isVal(rec["CDR Appt. Done"]);
 
   const setterQueues = useMemo(() => {
     const map = new Map();
     Object.entries(claims).forEach(([leadId, c]) => {
+      if (!inAssignWin(c.at)) return; // scope to assignment-date window
       const rec = recById.get(String(leadId));
-      const e = map.get(c.by) || { name: c.byName, initials: c.initials, total: 0, touched: 0, contactedNoAppt: 0, apptSet: 0 };
+      const e = map.get(c.by) || { name: c.byName, initials: c.initials, total: 0, noTouch: 0, apptBySetter: 0, apptByField: 0 };
       e.total++;
       if (rec) {
-        if (hasApptSet(rec)) e.apptSet++;
-        else if (isContacted(rec)) e.contactedNoAppt++;
-        if (setterTouched(rec, c.byName)) e.touched++;
+        if (!setterTouched(rec, c.byName)) e.noTouch++;
+        if (hasApptSet(rec)) {
+          if (apptSetByAuthor(rec, c.byName)) e.apptBySetter++;
+          else e.apptByField++;
+        }
       }
       map.set(c.by, e);
     });
     return [...map.entries()].map(([email, v]) => ({ email, ...v })).sort((a, b) => b.total - a.total);
-  }, [claims, recById]);
+  }, [claims, recById, assignWin, now]);
   const pct = (n, d) => (d ? Math.round((n / d) * 100) : 0) + "%";
 
   // When one setter is selected, reconcile their Assigned total to what's on the board.
   const selSetter = (claimedByF !== "all" && claimedByF !== "unclaimed") ? claimedByF : null;
   const recon = useMemo(() => {
     if (!selSetter) return null;
-    const ids = Object.entries(claims).filter(([, c]) => c.by === selSetter).map(([id]) => String(id));
+    const ids = Object.entries(claims)
+      .filter(([, c]) => c.by === selSetter && inAssignWin(c.at)).map(([id]) => String(id));
     const eligibleIds = new Set(eligible.map((r) => String(r.leads_id)));
-    let apptSet = 0, open = 0;
-    ids.forEach((id) => {
-      if (eligibleIds.has(id)) open++;
-      else if (recById.get(id) && hasApptSet(recById.get(id))) apptSet++;
-    });
+    let open = 0;
+    ids.forEach((id) => { if (eligibleIds.has(id)) open++; });
     const total = ids.length;
     const name = setterQueues.find((s) => s.email === selSetter)?.name || selSetter;
-    return { name, total, open, apptSet, other: Math.max(0, total - open - apptSet) };
-  }, [selSetter, claims, eligible, recById, setterQueues]);
+    return { name, total, open, other: Math.max(0, total - open) };
+  }, [selSetter, claims, eligible, recById, setterQueues, assignWin, now]);
 
   const rows = useMemo(() => {
     let list = segFiltered.filter((r) => {
@@ -624,14 +659,14 @@ export default function AppointmentSetterBoard() {
   };
   const sortArrow = (key) => (key === sortKey ? (sortDir === "desc" ? " ↓" : " ↑") : "");
 
-  useEffect(() => setPage(0), [tab, teamF, branchF, repExcluded, touchWin, leadWin, q, sortKey, sortDir, ageSeg, claimedByF]);
-  useEffect(() => setSel(new Set()), [tab, teamF, branchF, repExcluded, touchWin, leadWin, q, sortKey, sortDir, ageSeg, claimedByF, page]);
+  useEffect(() => setPage(0), [tab, teamF, branchF, repExcluded, touchWin, leadWin, assignWin, q, sortKey, sortDir, ageSeg, claimedByF]);
+  useEffect(() => setSel(new Set()), [tab, teamF, branchF, repExcluded, touchWin, leadWin, assignWin, q, sortKey, sortDir, ageSeg, claimedByF, page]);
   const pages = Math.max(1, Math.ceil(rows.length / PAGE));
   const pageRows = showAll ? rows : rows.slice(page * PAGE, page * PAGE + PAGE);
   const toggleSel = (id) => setSel((s) => { const n = new Set(s); n.has(id) ? n.delete(id) : n.add(id); return n; });
 
   const exportCSV = () => {
-    const catLabel = { nocontact: "No contact", attempted: "Attempted · no success", contacted: "Contacted · no appt" };
+    const catLabel = { noattempt: "No contact attempted", attempted: "Contact attempted", apptmade: "Appointment made" };
     const cols = [
       ["Lead ID", (r) => r.leads_id],
       ["Customer", (r) => r.account_name],
@@ -761,7 +796,8 @@ export default function AppointmentSetterBoard() {
           onAll={() => setRepExcluded(new Set())}
           onNone={() => setRepExcluded(new Set(reps))} />
         <Pick label="Since touch" value={touchWin} onChange={setTouchWin} opts={WIN_OPTS} />
-        <Pick label="Lead in" value={leadWin} onChange={setLeadWin} opts={WIN_OPTS} />
+        <Pick label="Lead in" value={leadWin} onChange={setLeadWin} opts={LEAD_WIN_OPTS} />
+        {isAdmin && <Pick label="Assigned" value={assignWin} onChange={setAssignWin} opts={ASSIGN_WIN_OPTS} />}
         <Pick label="Claimed by" value={claimedByF} onChange={setClaimedByF}
           opts={[["all", "Anyone"], ["unclaimed", "Unclaimed"],
             ...Object.entries(ACCESS_MAP).map(([em, u]) => [em, u.role === "admin" ? `${u.name} (admin)` : u.name])]} />
@@ -774,11 +810,11 @@ export default function AppointmentSetterBoard() {
         <div className="asb-sq">
           <div className="asb-sq-head">
             <Shield size={12} /> Setter queues
-            <span>· assigned opps, how many the setter has touched, how many are contacted with no appt yet, and how many have an appointment set</span>
+            <span>· per setter: opps assigned, how many the setter hasn't touched, and appointments set by the setter vs by the field rep</span>
           </div>
           <div className="asb-sq-table">
             <div className="asb-sq-row asb-sq-th">
-              <div>Setter</div><div>Assigned</div><div>≥1 setter touch</div><div>Contacted · no appt</div><div>Appt set</div>
+              <div>Setter</div><div>Assigned</div><div>No setter touch</div><div>Appt by setter</div><div>Appt by field rep</div>
             </div>
             {setterQueues.map((s) => (
               <div key={s.email} className={`asb-sq-row ${claimedByF === s.email ? "on" : ""}`}
@@ -786,13 +822,15 @@ export default function AppointmentSetterBoard() {
                 title={`Filter the board to ${s.name}'s open opps`}>
                 <div className="asb-sq-name"><span className="asb-av">{s.initials}</span>{s.name}</div>
                 <div><b>{s.total}</b></div>
-                <div>{s.touched} <span className="asb-sq-pct">({pct(s.touched, s.total)})</span></div>
-                <div>{s.contactedNoAppt} <span className="asb-sq-pct">({pct(s.contactedNoAppt, s.total)})</span></div>
-                <div>{s.apptSet} <span className="asb-sq-pct">({pct(s.apptSet, s.total)})</span></div>
+                <div>{s.noTouch} <span className="asb-sq-pct">({pct(s.noTouch, s.total)})</span></div>
+                <div>{s.apptBySetter} <span className="asb-sq-pct">({pct(s.apptBySetter, s.total)})</span></div>
+                <div>{s.apptByField} <span className="asb-sq-pct">({pct(s.apptByField, s.total)})</span></div>
               </div>
             ))}
           </div>
-          <div className="asb-sq-note">Assigned includes opps that already have an appointment set — those still count here but leave the working board below. Click a setter to filter the board to their open opps.</div>
+          <div className="asb-sq-note">
+            Assigned counts every opp claimed by the setter{assignWin !== "any" ? " in the selected assignment window" : ""}, including ones that already have an appointment. "Appt by setter" vs "by field rep" is inferred from who logged the appointment in the comments. Click a setter to filter the board to their open opps.
+          </div>
         </div>
       )}
 
@@ -800,9 +838,8 @@ export default function AppointmentSetterBoard() {
       {recon && (
         <div className="asb-recon">
           <b>{recon.name}</b> · <b>{recon.total}</b> assigned ={" "}
-          <span className="asb-recon-open">{recon.open} open below</span> +{" "}
-          <span className="asb-recon-appt">{recon.apptSet} appt set</span>
-          {recon.other > 0 && <> + <span className="asb-recon-other">{recon.other} quoted / no longer eligible</span></>}
+          <span className="asb-recon-open">{recon.open} shown below</span>
+          {recon.other > 0 && <> + <span className="asb-recon-other">{recon.other} not shown (quoted / lost / no longer eligible)</span></>}
           <button className="asb-recon-clear" onClick={() => setClaimedByF("all")}>clear</button>
         </div>
       )}
