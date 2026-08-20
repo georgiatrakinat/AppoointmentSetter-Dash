@@ -355,6 +355,7 @@ export default function AppointmentSetterBoard() {
   const [sel, setSel] = useState(() => new Set()); // admin multi-select
   const [assignTo, setAssignTo] = useState("");
   const [showAll, setShowAll] = useState(false);
+  const [drill, setDrill] = useState(null); // {by, metric} — Setter Queues drill-down
   const [page, setPage] = useState(0);
   const [hover, setHover] = useState(null); // {rec, x, y}
   const [records, setRecords] = useState(null); // raw feed (null=loading)
@@ -659,10 +660,32 @@ export default function AppointmentSetterBoard() {
   };
   const sortArrow = (key) => (key === sortKey ? (sortDir === "desc" ? " ↓" : " ↑") : "");
 
-  useEffect(() => setPage(0), [tab, teamF, branchF, repExcluded, touchWin, leadWin, assignWin, q, sortKey, sortDir, ageSeg, claimedByF]);
-  useEffect(() => setSel(new Set()), [tab, teamF, branchF, repExcluded, touchWin, leadWin, assignWin, q, sortKey, sortDir, ageSeg, claimedByF, page]);
-  const pages = Math.max(1, Math.ceil(rows.length / PAGE));
-  const pageRows = showAll ? rows : rows.slice(page * PAGE, page * PAGE + PAGE);
+  // Drill-down: click a Setter Queues metric to see exactly those leads (across categories,
+  // including opps that dropped off the normal board view). Built from raw records + claims.
+  const METRIC_LABEL = { assigned: "assigned", notouch: "no setter touch", apptsetter: "appt by setter", apptfield: "appt by field rep" };
+  const drillRows = useMemo(() => {
+    if (!drill) return null;
+    const out = [];
+    Object.entries(claims).forEach(([leadId, c]) => {
+      if (c.by !== drill.by || !inAssignWin(c.at)) return;
+      const rec = recById.get(String(leadId));
+      if (!rec) return;
+      let keep = true;
+      if (drill.metric === "notouch") keep = !setterTouched(rec, c.byName);
+      else if (drill.metric === "apptsetter") keep = hasApptSet(rec) && apptSetByAuthor(rec, c.byName);
+      else if (drill.metric === "apptfield") keep = hasApptSet(rec) && !apptSetByAuthor(rec, c.byName);
+      if (keep) out.push(enrich(rec, now));
+    });
+    return out.sort((a, b) => (b.leadInMs || 0) - (a.leadInMs || 0));
+  }, [drill, claims, recById, now, assignWin]);
+  const drillName = drill ? (setterQueues.find((s) => s.email === drill.by)?.name || drill.by) : "";
+
+  const displayRows = drill ? drillRows : rows;
+
+  useEffect(() => setPage(0), [tab, teamF, branchF, repExcluded, touchWin, leadWin, assignWin, q, sortKey, sortDir, ageSeg, claimedByF, drill]);
+  useEffect(() => setSel(new Set()), [tab, teamF, branchF, repExcluded, touchWin, leadWin, assignWin, q, sortKey, sortDir, ageSeg, claimedByF, drill, page]);
+  const pages = Math.max(1, Math.ceil(displayRows.length / PAGE));
+  const pageRows = showAll ? displayRows : displayRows.slice(page * PAGE, page * PAGE + PAGE);
   const toggleSel = (id) => setSel((s) => { const n = new Set(s); n.has(id) ? n.delete(id) : n.add(id); return n; });
 
   const exportCSV = () => {
@@ -683,7 +706,7 @@ export default function AppointmentSetterBoard() {
     ];
     const esc = (v) => `"${String(v ?? "").replace(/\r?\n/g, " ").replace(/"/g, '""')}"`;
     const csv = [cols.map((c) => esc(c[0])).join(",")]
-      .concat(rows.map((r) => cols.map((c) => esc(c[1](r))).join(",")))
+      .concat(displayRows.map((r) => cols.map((c) => esc(c[1](r))).join(",")))
       .join("\r\n");
     const blob = new Blob(["\ufeff" + csv], { type: "text/csv;charset=utf-8;" });
     const url = URL.createObjectURL(blob);
@@ -723,7 +746,21 @@ export default function AppointmentSetterBoard() {
       {/* Header */}
       <header className="asb-head">
         <div className="asb-brand">
-          <span className="asb-drop" />
+          <span className="asb-gem" aria-label="White Stone">
+            <svg viewBox="0 0 32 32" width="30" height="30" xmlns="http://www.w3.org/2000/svg">
+              <defs>
+                <linearGradient id="asbGemFace" x1="0" y1="0" x2="0" y2="1">
+                  <stop offset="0" stopColor="#ffffff" />
+                  <stop offset="1" stopColor="#dfe6ef" />
+                </linearGradient>
+              </defs>
+              <polygon points="16,2 27,12 16,30 5,12" fill="url(#asbGemFace)" stroke="#9fb2c6" strokeWidth="1" strokeLinejoin="round" />
+              <polygon points="5,12 27,12 16,30" fill="#eef2f7" opacity="0.9" />
+              <polygon points="16,2 21.5,12 16,30 10.5,12" fill="#ffffff" opacity="0.75" />
+              <path d="M5,12 L11,12 L16,2 Z" fill="#ffffff" opacity="0.95" />
+              <path d="M16,2 L27,12 M5,12 L27,12 M10.5,12 L16,30 M21.5,12 L16,30" stroke="#b9c6d6" strokeWidth="0.6" fill="none" />
+            </svg>
+          </span>
           <div>
             <h1>Appointment Setter Board</h1>
             <p>Residential leads the field rep didn't reach in time — claim, dial, set the appointment.</p>
@@ -821,15 +858,15 @@ export default function AppointmentSetterBoard() {
                 onClick={() => setClaimedByF(claimedByF === s.email ? "all" : s.email)}
                 title={`Filter the board to ${s.name}'s open opps`}>
                 <div className="asb-sq-name"><span className="asb-av">{s.initials}</span>{s.name}</div>
-                <div><b>{s.total}</b></div>
-                <div>{s.noTouch} <span className="asb-sq-pct">({pct(s.noTouch, s.total)})</span></div>
-                <div>{s.apptBySetter} <span className="asb-sq-pct">({pct(s.apptBySetter, s.total)})</span></div>
-                <div>{s.apptByField} <span className="asb-sq-pct">({pct(s.apptByField, s.total)})</span></div>
+                <div className="asb-sq-num" onClick={(e) => { e.stopPropagation(); setDrill({ by: s.email, metric: "assigned" }); }}><b>{s.total}</b></div>
+                <div className="asb-sq-num" onClick={(e) => { e.stopPropagation(); setDrill({ by: s.email, metric: "notouch" }); }}>{s.noTouch} <span className="asb-sq-pct">({pct(s.noTouch, s.total)})</span></div>
+                <div className="asb-sq-num" onClick={(e) => { e.stopPropagation(); setDrill({ by: s.email, metric: "apptsetter" }); }}>{s.apptBySetter} <span className="asb-sq-pct">({pct(s.apptBySetter, s.total)})</span></div>
+                <div className="asb-sq-num" onClick={(e) => { e.stopPropagation(); setDrill({ by: s.email, metric: "apptfield" }); }}>{s.apptByField} <span className="asb-sq-pct">({pct(s.apptByField, s.total)})</span></div>
               </div>
             ))}
           </div>
           <div className="asb-sq-note">
-            Assigned counts every opp claimed by the setter{assignWin !== "any" ? " in the selected assignment window" : ""}, including ones that already have an appointment. "Appt by setter" vs "by field rep" is inferred from who logged the appointment in the comments. Click a setter to filter the board to their open opps.
+            Assigned counts every opp claimed by the setter{assignWin !== "any" ? " in the selected assignment window" : ""}, including ones that already have an appointment. "Appt by setter" vs "by field rep" is inferred from who logged the appointment in the comments. <b>Click any number</b> to see those exact leads below; click a setter's name to filter the board to their open opps.
           </div>
         </div>
       )}
@@ -857,7 +894,7 @@ export default function AppointmentSetterBoard() {
       {/* Tabs */}
       <nav className="asb-tabs">
         {TABS.map((t) => (
-          <button key={t.id} className={`asb-tab ${tab === t.id ? "on" : ""}`} onClick={() => setTab(t.id)}>
+          <button key={t.id} className={`asb-tab ${tab === t.id ? "on" : ""}`} onClick={() => { setDrill(null); setTab(t.id); }}>
             {t.label}<span className="asb-count">{counts[t.id]}</span>
             <span className="asb-info" onClick={(e) => e.stopPropagation()}>
               <Info size={12} />
@@ -889,6 +926,14 @@ export default function AppointmentSetterBoard() {
             Assign to queue
           </button>
           <button className="asb-bulk-clear" onClick={() => setSel(new Set())}>Clear</button>
+        </div>
+      )}
+
+      {/* Drill-down banner */}
+      {drill && (
+        <div className="asb-drill">
+          Showing <b>{drillName}</b> · <b>{drillRows.length}</b> {METRIC_LABEL[drill.metric]} — these exact leads, across all categories.
+          <button className="asb-drill-clear" onClick={() => setDrill(null)}>← back to board</button>
         </div>
       )}
 
@@ -1094,7 +1139,7 @@ const CSS = `
 
 .asb-head{display:flex;justify-content:space-between;align-items:flex-start;gap:16px;margin-bottom:16px;}
 .asb-brand{display:flex;gap:12px;align-items:flex-start;}
-.asb-drop{width:30px;height:30px;border-radius:50% 50% 50% 0;background:linear-gradient(150deg,#22d3ee,#0d9488);transform:rotate(-45deg);flex:none;margin-top:2px;box-shadow:0 2px 8px rgba(13,148,136,.35);}
+.asb-gem{flex:none;margin-top:2px;display:inline-flex;filter:drop-shadow(0 2px 5px rgba(120,140,170,.35));}
 .asb-brand h1{font-size:18px;font-weight:680;margin:0;letter-spacing:-.01em;}
 .asb-brand p{margin:2px 0 0;color:var(--muted);font-size:12px;}
 .asb-head-right{display:flex;gap:8px;align-items:center;}
@@ -1179,6 +1224,12 @@ const CSS = `
 .asb-sq-row.on .asb-sq-name .asb-av{background:var(--indigo);}
 .asb-sq-row b{font-family:ui-monospace,Menlo,monospace;}
 .asb-sq-pct{color:var(--muted);font-size:11px;}
+.asb-sq-num{cursor:pointer;border-radius:6px;padding:2px 4px;margin:-2px -4px;}
+.asb-sq-num:hover{background:#eef2ff;color:var(--indigo);}
+.asb-drill{display:flex;align-items:center;gap:6px;flex-wrap:wrap;background:#0e1217;color:#fff;border-radius:9px;padding:9px 13px;margin-top:10px;font-size:12.5px;}
+.asb-drill b{color:#fff;}
+.asb-drill-clear{margin-left:auto;background:rgba(255,255,255,.14);border:none;color:#fff;font:inherit;font-size:12px;cursor:pointer;border-radius:7px;padding:4px 10px;}
+.asb-drill-clear:hover{background:rgba(255,255,255,.24);}
 .asb-sq-note{font-size:11px;color:var(--muted);margin-top:8px;line-height:1.5;}
 .asb-tr.is-mine{background:#f6f5ff;}
 .asb-tr.is-locked{background:#fbfbfc;}
