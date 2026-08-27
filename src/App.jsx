@@ -624,13 +624,14 @@ export default function AppointmentSetterBoard() {
     if (!selSetter) return null;
     const ids = Object.entries(claims)
       .filter(([, c]) => c.by === selSetter && inAssignWin(c.at)).map(([id]) => String(id));
-    const eligibleIds = new Set(eligible.map((r) => String(r.leads_id)));
+    const byId = new Map(eligible.map((r) => [String(r.leads_id), r]));
+    const cat = { noattempt: 0, attempted: 0, apptmade: 0 };
     let open = 0;
-    ids.forEach((id) => { if (eligibleIds.has(id)) open++; });
+    ids.forEach((id) => { const er = byId.get(id); if (er) { open++; cat[er.category]++; } });
     const total = ids.length;
     const name = setterQueues.find((s) => s.email === selSetter)?.name || selSetter;
-    return { name, total, open, other: Math.max(0, total - open) };
-  }, [selSetter, claims, eligible, recById, setterQueues, assignWin, now]);
+    return { name, total, open, cat, other: Math.max(0, total - open) };
+  }, [selSetter, claims, eligible, setterQueues, assignWin, now]);
 
   const rows = useMemo(() => {
     let list = segFiltered.filter((r) => {
@@ -858,10 +859,10 @@ export default function AppointmentSetterBoard() {
                 onClick={() => setClaimedByF(claimedByF === s.email ? "all" : s.email)}
                 title={`Filter the board to ${s.name}'s open opps`}>
                 <div className="asb-sq-name"><span className="asb-av">{s.initials}</span>{s.name}</div>
-                <div className="asb-sq-num" onClick={(e) => { e.stopPropagation(); setDrill({ by: s.email, metric: "assigned" }); }}><b>{s.total}</b></div>
-                <div className="asb-sq-num" onClick={(e) => { e.stopPropagation(); setDrill({ by: s.email, metric: "notouch" }); }}>{s.noTouch} <span className="asb-sq-pct">({pct(s.noTouch, s.total)})</span></div>
-                <div className="asb-sq-num" onClick={(e) => { e.stopPropagation(); setDrill({ by: s.email, metric: "apptsetter" }); }}>{s.apptBySetter} <span className="asb-sq-pct">({pct(s.apptBySetter, s.total)})</span></div>
-                <div className="asb-sq-num" onClick={(e) => { e.stopPropagation(); setDrill({ by: s.email, metric: "apptfield" }); }}>{s.apptByField} <span className="asb-sq-pct">({pct(s.apptByField, s.total)})</span></div>
+                <div className="asb-sq-num" onClick={(e) => { e.stopPropagation(); setDrill(null); setClaimedByF(s.email); }}><b>{s.total}</b></div>
+                <div className="asb-sq-num" onClick={(e) => { e.stopPropagation(); setClaimedByF(s.email); setDrill({ by: s.email, metric: "notouch" }); }}>{s.noTouch} <span className="asb-sq-pct">({pct(s.noTouch, s.total)})</span></div>
+                <div className="asb-sq-num" onClick={(e) => { e.stopPropagation(); setClaimedByF(s.email); setDrill({ by: s.email, metric: "apptsetter" }); }}>{s.apptBySetter} <span className="asb-sq-pct">({pct(s.apptBySetter, s.total)})</span></div>
+                <div className="asb-sq-num" onClick={(e) => { e.stopPropagation(); setClaimedByF(s.email); setDrill({ by: s.email, metric: "apptfield" }); }}>{s.apptByField} <span className="asb-sq-pct">({pct(s.apptByField, s.total)})</span></div>
               </div>
             ))}
           </div>
@@ -872,11 +873,12 @@ export default function AppointmentSetterBoard() {
       )}
 
       {/* Per-setter reconciliation: assigned = open + appt set + other */}
-      {recon && (
+      {recon && !drill && (
         <div className="asb-recon">
           <b>{recon.name}</b> · <b>{recon.total}</b> assigned ={" "}
           <span className="asb-recon-open">{recon.open} shown below</span>
-          {recon.other > 0 && <> + <span className="asb-recon-other">{recon.other} not shown (quoted / lost / no longer eligible)</span></>}
+          <span className="asb-recon-cat">({recon.cat.noattempt} no contact · {recon.cat.attempted} attempted · {recon.cat.apptmade} appt made)</span>
+          {recon.other > 0 && <> + <span className="asb-recon-other">{recon.other} not shown (quoted / lost / not in feed)</span></>}
           <button className="asb-recon-clear" onClick={() => setClaimedByF("all")}>clear</button>
         </div>
       )}
@@ -1185,6 +1187,7 @@ const CSS = `
 .asb-recon-open{color:var(--teal);font-weight:560;}
 .asb-recon-appt{color:var(--indigo);font-weight:560;}
 .asb-recon-other{color:var(--amber);font-weight:560;}
+.asb-recon-cat{color:var(--muted);font-size:11.5px;}
 .asb-recon-clear{margin-left:auto;background:none;border:none;color:var(--muted);font:inherit;font-size:12px;cursor:pointer;text-decoration:underline;}
 
 .asb-tabs{display:flex;gap:4px;border-bottom:1px solid var(--line);margin-bottom:2px;}
