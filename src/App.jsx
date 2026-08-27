@@ -598,13 +598,25 @@ export default function AppointmentSetterBoard() {
     return parseComments(rec.comments).lines.some((l) => l.who && repKey(l.who) === key);
   };
 
+  // Eligible lead → category, for "active assigned" (workable = eligible and not appt-made).
+  const eligibleCatById = useMemo(() => {
+    const m = new Map();
+    eligible.forEach((r) => m.set(String(r.leads_id), r.category));
+    return m;
+  }, [eligible]);
+  const isActive = (leadId) => {
+    const cat = eligibleCatById.get(String(leadId));
+    return !!cat && cat !== "apptmade";
+  };
+
   const setterQueues = useMemo(() => {
     const map = new Map();
     Object.entries(claims).forEach(([leadId, c]) => {
       if (!inAssignWin(c.at)) return; // scope to assignment-date window
       const rec = recById.get(String(leadId));
-      const e = map.get(c.by) || { name: c.byName, initials: c.initials, total: 0, noTouch: 0, apptBySetter: 0, apptByField: 0 };
+      const e = map.get(c.by) || { name: c.byName, initials: c.initials, total: 0, active: 0, noTouch: 0, apptBySetter: 0, apptByField: 0 };
       e.total++;
+      if (isActive(leadId)) e.active++;
       if (rec) {
         if (!setterTouched(rec, c.byName)) e.noTouch++;
         if (hasApptSet(rec)) {
@@ -615,7 +627,7 @@ export default function AppointmentSetterBoard() {
       map.set(c.by, e);
     });
     return [...map.entries()].map(([email, v]) => ({ email, ...v })).sort((a, b) => b.total - a.total);
-  }, [claims, recById, assignWin, now]);
+  }, [claims, recById, eligibleCatById, assignWin, now]);
   const pct = (n, d) => (d ? Math.round((n / d) * 100) : 0) + "%";
 
   // When one setter is selected, reconcile their Assigned total to what's on the board.
@@ -663,7 +675,7 @@ export default function AppointmentSetterBoard() {
 
   // Drill-down: click a Setter Queues metric to see exactly those leads (across categories,
   // including opps that dropped off the normal board view). Built from raw records + claims.
-  const METRIC_LABEL = { assigned: "assigned", notouch: "no setter touch", apptsetter: "appt by setter", apptfield: "appt by field rep" };
+  const METRIC_LABEL = { active: "active (workable)", notouch: "no setter touch", apptsetter: "appt by setter", apptfield: "appt by field rep" };
   const drillRows = useMemo(() => {
     if (!drill) return null;
     const out = [];
@@ -672,13 +684,14 @@ export default function AppointmentSetterBoard() {
       const rec = recById.get(String(leadId));
       if (!rec) return;
       let keep = true;
-      if (drill.metric === "notouch") keep = !setterTouched(rec, c.byName);
+      if (drill.metric === "active") keep = isActive(leadId);
+      else if (drill.metric === "notouch") keep = !setterTouched(rec, c.byName);
       else if (drill.metric === "apptsetter") keep = hasApptSet(rec) && apptSetByAuthor(rec, c.byName);
       else if (drill.metric === "apptfield") keep = hasApptSet(rec) && !apptSetByAuthor(rec, c.byName);
       if (keep) out.push(enrich(rec, now));
     });
     return out.sort((a, b) => (b.leadInMs || 0) - (a.leadInMs || 0));
-  }, [drill, claims, recById, now, assignWin]);
+  }, [drill, claims, recById, eligibleCatById, now, assignWin]);
   const drillName = drill ? (setterQueues.find((s) => s.email === drill.by)?.name || drill.by) : "";
 
   const displayRows = drill ? drillRows : rows;
@@ -852,7 +865,7 @@ export default function AppointmentSetterBoard() {
           </div>
           <div className="asb-sq-table">
             <div className="asb-sq-row asb-sq-th">
-              <div>Setter</div><div>Assigned</div><div>No setter touch</div><div>Appt by setter</div><div>Appt by field rep</div>
+              <div>Setter</div><div>Assigned</div><div>Active</div><div>No setter touch</div><div>Appt by setter</div><div>Appt by field rep</div>
             </div>
             {setterQueues.map((s) => (
               <div key={s.email} className={`asb-sq-row ${claimedByF === s.email ? "on" : ""}`}
@@ -860,6 +873,7 @@ export default function AppointmentSetterBoard() {
                 title={`Filter the board to ${s.name}'s open opps`}>
                 <div className="asb-sq-name"><span className="asb-av">{s.initials}</span>{s.name}</div>
                 <div className="asb-sq-num" onClick={(e) => { e.stopPropagation(); setDrill(null); setClaimedByF(s.email); }}><b>{s.total}</b></div>
+                <div className="asb-sq-num" onClick={(e) => { e.stopPropagation(); setClaimedByF(s.email); setDrill({ by: s.email, metric: "active" }); }}><b className="asb-active">{s.active}</b> <span className="asb-sq-pct">({pct(s.active, s.total)})</span></div>
                 <div className="asb-sq-num" onClick={(e) => { e.stopPropagation(); setClaimedByF(s.email); setDrill({ by: s.email, metric: "notouch" }); }}>{s.noTouch} <span className="asb-sq-pct">({pct(s.noTouch, s.total)})</span></div>
                 <div className="asb-sq-num" onClick={(e) => { e.stopPropagation(); setClaimedByF(s.email); setDrill({ by: s.email, metric: "apptsetter" }); }}>{s.apptBySetter} <span className="asb-sq-pct">({pct(s.apptBySetter, s.total)})</span></div>
                 <div className="asb-sq-num" onClick={(e) => { e.stopPropagation(); setClaimedByF(s.email); setDrill({ by: s.email, metric: "apptfield" }); }}>{s.apptByField} <span className="asb-sq-pct">({pct(s.apptByField, s.total)})</span></div>
@@ -867,7 +881,7 @@ export default function AppointmentSetterBoard() {
             ))}
           </div>
           <div className="asb-sq-note">
-            Assigned counts every opp claimed by the setter{assignWin !== "any" ? " in the selected assignment window" : ""}, including ones that already have an appointment. "Appt by setter" vs "by field rep" is inferred from who logged the appointment in the comments. <b>Click any number</b> to see those exact leads below; click a setter's name to filter the board to their open opps.
+            <b>Assigned</b> is every opp claimed by the setter{assignWin !== "any" ? " in the selected window" : ""}. <b>Active</b> is only the ones still workable — it excludes appointments already made and opps not shown on the board (quoted, lost, or no longer in the feed). "Appt by setter" vs "by field rep" is inferred from who logged the appointment. <b>Click any number</b> to see those exact leads below; click a setter's name to filter the board to them.
           </div>
         </div>
       )}
@@ -1216,7 +1230,7 @@ const CSS = `
 .asb-sq-head{display:flex;align-items:center;gap:6px;font-size:11px;font-weight:680;text-transform:uppercase;letter-spacing:.04em;color:var(--indigo);margin-bottom:9px;}
 .asb-sq-head span{font-weight:450;text-transform:none;letter-spacing:0;color:var(--muted);font-size:11.5px;}
 .asb-sq-table{border:1px solid var(--line);border-radius:9px;overflow:hidden;}
-.asb-sq-row{display:grid;grid-template-columns:1.6fr .7fr 1fr 1.1fr .9fr;gap:10px;align-items:center;padding:8px 12px;border-bottom:1px solid var(--line);font-size:12.5px;cursor:pointer;}
+.asb-sq-row{display:grid;grid-template-columns:1.5fr .7fr .8fr 1fr 1fr 1fr;gap:10px;align-items:center;padding:8px 12px;border-bottom:1px solid var(--line);font-size:12.5px;cursor:pointer;}
 .asb-sq-row:last-child{border-bottom:none;}
 .asb-sq-row:not(.asb-sq-th):hover{background:#f7f8fa;}
 .asb-sq-row.on{background:#eef2ff;}
@@ -1229,6 +1243,7 @@ const CSS = `
 .asb-sq-pct{color:var(--muted);font-size:11px;}
 .asb-sq-num{cursor:pointer;border-radius:6px;padding:2px 4px;margin:-2px -4px;}
 .asb-sq-num:hover{background:#eef2ff;color:var(--indigo);}
+.asb-active{color:var(--teal);}
 .asb-drill{display:flex;align-items:center;gap:6px;flex-wrap:wrap;background:#0e1217;color:#fff;border-radius:9px;padding:9px 13px;margin-top:10px;font-size:12.5px;}
 .asb-drill b{color:#fff;}
 .asb-drill-clear{margin-left:auto;background:rgba(255,255,255,.14);border:none;color:#fff;font:inherit;font-size:12px;cursor:pointer;border-radius:7px;padding:4px 10px;}
