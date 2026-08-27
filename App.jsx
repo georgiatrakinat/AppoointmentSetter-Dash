@@ -56,6 +56,12 @@ const isJunkName = (r) => /\b(yelp|brand|corporate)\b/i.test(r.account_name || "
 // so failed attempts ("left message", "no answer", "disconnected") don't match.
 const CONTACTED_TEXT_RE = /\b(spoke|talked)\s+(to|with)\b|\b(customer|client|cust|he|she|they)\s+(said|says|mentioned|asked|answered)\b|\b(customer|client|cust)\s+(wants|needs|would\s+like|prefers|is\s+interested|is\s+looking|are\s+looking)\b|\banswered\s+the\s+(phone|call)\b|\bon\s+the\s+phone\s+with\b|\bpicked\s*up\b|\breached\s+(the\s+)?(customer|client|him|her|them)\b/i;
 
+// Reusable contacted check (structured marker, Contact column, or conversation text).
+const isContacted = (r) =>
+  /Dialed Contact:\s*Contacted/i.test(r.comments || "") ||
+  isVal(r.Contact) ||
+  CONTACTED_TEXT_RE.test(r.comments || "");
+
 // sLeads are tagged in account_type, e.g. "sLead / Relead". Match the sLead token.
 const isSLead = (r) => /\bs[-\s]?lead/i.test(String(r.account_type || ""));
 const isCommercial = (_r) => false;    // PROD: commercial field name still unconfirmed in feed
@@ -202,11 +208,18 @@ function deriveMilestone(r) {
   if (isVal(r.Dialed)) return "Dialed";
   return "New";
 }
-// Drop anything that has reached Set Appt or any later milestone (4-8 in the CRM:
-// Set Appt, Appt Completed, CDR Appt Done, Quote sent, Letter Sent).
-const pastApptStage = (r) =>
-  isVal(r["Set Appt"]) || isVal(r["Appt. Completed"]) || isVal(r["CDR Appt. Done"]) ||
-  isVal(r["Quote Sent"]) || isVal(r["Letter Sent"]);
+// Appointment set = a date in any of these three CRM fields, regardless of who set it.
+const hasApptSet = (r) =>
+  isVal(r["Set Appt"]) || isVal(r["Appt. Completed"]) || isVal(r["CDR Appt. Done"]);
+// Quoted / letter-sent but no appointment — still hidden from the board (further along, no appt).
+const quotedNoAppt = (r) =>
+  !hasApptSet(r) && (isVal(r["Quote Sent"]) || isVal(r["Letter Sent"]));
+// Who set the appointment — inferred from an appointment-setting comment's author.
+const APPT_SET_RE = /\bset\s+appt|\bset\s+appointment|\bappointment\s+set|\bappt\.?\s+set|\bbooked\s+(the\s+|an\s+)?appt|\bset\s+(an\s+|the\s+)?appointment/i;
+const apptSetByAuthor = (rec, personName) => {
+  const key = repKey(personName);
+  return parseComments(rec.comments).lines.some((l) => l.who && repKey(l.who) === key && APPT_SET_RE.test(l.text || ""));
+};
 const isLost = (r) =>
   r.status_id === 6 || /lost\s*sale/i.test(r.status || "") || LOST_RE.test(r.comments || "");
 const isResidential = (r) => String(r.professional).toLowerCase() !== "true" && !isCommercial(r);
@@ -219,9 +232,6 @@ function enrich(r, now) {
   const leadInMs = isVal(r.lead_created_time)
     ? Date.parse(String(r.lead_created_time).replace(" ", "T"))
     : firstMs;
-  const contacted = p.contacted || isVal(r.Contact) || CONTACTED_TEXT_RE.test(r.comments || "");
-  // Any commentary entry counts as a touch; never undercount below populated stage
-  // columns (Dialed/Email/Contact). Last touch = latest of last comment or stage date.
   const stageTouches = [r.Dialed, r["Email Sent"], r.Contact].filter(isVal).length;
   const commentEntries = p.lines.filter((l) => l.ts).length;
   const touches = Math.max(commentEntries, stageTouches);
@@ -230,8 +240,9 @@ function enrich(r, now) {
       .filter(isVal).map((d) => Date.parse(String(d).replace(" ", "T"))).filter((n) => !isNaN(n));
     return ds.length ? Math.max(...ds) : null;
   })();
-  let category = "nocontact";
-  if (contacted) category = "contacted";
+  // Three buckets: appointment made → contact attempted → no contact attempted.
+  let category = "noattempt";
+  if (hasApptSet(r)) category = "apptmade";
   else if (touches > 0) category = "attempted";
   // Roster lookup drives team + branch (name suffix alone is unreliable; see Richard Foronda).
   const ro = ROSTER[repKey(r.salesreps_name)];
@@ -245,7 +256,6 @@ function enrich(r, now) {
     team: teamVal,
     milestone: deriveMilestone(r),
     touches: touches,
-    contacted,
     lastAttemptBy: p.lastAttemptBy,
     lastAttemptTs: p.lastAttemptTs,
     lines: p.lines,
@@ -276,17 +286,17 @@ const fmtClock = (ms) => {
 };
 
 const TABS = [
-  { id: "nocontact", label: "No contact",
-    desc: "Nobody has logged any activity on this lead yet — no dials, no emails, no comments. Fresh territory: you're the first touch." },
-  { id: "attempted", label: "Attempted · no success",
-    desc: "Someone has tried to reach this customer (dialed, emailed, texted, or left a message) but there's no sign anyone actually spoke with them. Best odds for a set — keep working the phone." },
-  { id: "contacted", label: "Contacted · no appt",
-    desc: "A real conversation happened — detected from a 'Contacted' marker, a contact date, or notes describing a live conversation — but no appointment was ever booked. Re-engage these." },
+  { id: "noattempt", label: "No contact attempted",
+    desc: "No outreach has been logged yet — no dials, emails, texts, or comments. Fresh; you're the first attempt." },
+  { id: "attempted", label: "Contact attempted",
+    desc: "Outreach has been attempted (dialed, emailed, texted, or a note logged) but no appointment is set yet. The active working pile." },
+  { id: "apptmade", label: "Appointment made",
+    desc: "An appointment is set on this lead — a date in Set Appt, Appt Completed, or CDR Appt Done." },
   { id: "mine", label: "My queue",
-    desc: "Leads you've claimed. They stay yours until you release them, so no one else will work them in the meantime." },
+    desc: "Leads you've claimed. They stay yours until you release them, so no one else works them in the meantime." },
 ];
 
-const POOL_NOTE = "This board shows residential leads the assigned field rep didn't reach within the first hour. Already excluded: booked/quoted leads (Set Appt or any later milestone), lost sales, sLeads, releads, prospects, existing customers, EM Duggan, and Yelp/brand/corporate placeholder records.";
+const POOL_NOTE = "This board shows residential leads the assigned field rep didn't reach within the first hour. Already excluded: quoted/letter-sent leads with no appointment, lost sales, sLeads, releads, prospects, existing customers, EM Duggan, and Yelp/brand/corporate placeholder records.";
 
 function FieldDiag({ records }) {
   const [open, setOpen] = useState(false);
@@ -328,19 +338,24 @@ export default function AppointmentSetterBoard() {
   const [me, setMe] = useState(null); // {email, name, initials, role}
   const [access, setAccess] = useState("resolving"); // resolving | ok | blocked | devpick
   const [signedEmail, setSignedEmail] = useState("");
-  const [claims, setClaims] = useState({}); // PROD: loadClaims() from shared store
-  const [tab, setTab] = useState("nocontact");
+  const [claims, setClaims] = useState({}); // shared claim store (via /api/claims)
+  const [apiOn, setApiOn] = useState(null); // null unknown | true (API live) | false (local fallback)
+  const [tab, setTab] = useState("noattempt");
   const [q, setQ] = useState("");
   const [teamF, setTeamF] = useState("all");
   const [branchF, setBranchF] = useState("all");
-  const [repF, setRepF] = useState("all");
+  const [repExcluded, setRepExcluded] = useState(() => new Set()); // empty = all reps shown
   const [touchWin, setTouchWin] = useState("any");
   const [leadWin, setLeadWin] = useState("any");
-  const [sort, setSort] = useState("newest");
+  const [assignWin, setAssignWin] = useState("any"); // admin: claim-date window
+  const [sortKey, setSortKey] = useState("leadin"); // leadin | touches | since
+  const [sortDir, setSortDir] = useState("desc");
+  const [claimedByF, setClaimedByF] = useState("all"); // admin: filter by who claimed
   const [ageSeg, setAgeSeg] = useState("aged"); // aged (>1h) | fresh (<1h)
   const [sel, setSel] = useState(() => new Set()); // admin multi-select
   const [assignTo, setAssignTo] = useState("");
   const [showAll, setShowAll] = useState(false);
+  const [drill, setDrill] = useState(null); // {by, metric} — Setter Queues drill-down
   const [page, setPage] = useState(0);
   const [hover, setHover] = useState(null); // {rec, x, y}
   const [records, setRecords] = useState(null); // raw feed (null=loading)
@@ -403,14 +418,63 @@ export default function AppointmentSetterBoard() {
     return () => clearInterval(t);
   }, []);
 
+  // ---- Shared claim store (Azure Function + Table Storage at /api/claims) ----
+  // Falls back to in-session state when the API isn't present (preview / local dev).
+  const CLAIMS_API = "/api/claims";
+  const loadClaims = async () => {
+    try {
+      const r = await fetch(CLAIMS_API, { headers: { "cache-control": "no-cache" } });
+      if (!r.ok) throw new Error("no api");
+      const data = await r.json();
+      setClaims(data || {});
+      setApiOn(true);
+    } catch {
+      setApiOn((v) => (v === true ? true : false)); // stay in local mode
+    }
+  };
+  useEffect(() => { loadClaims(); }, []);
+  useEffect(() => {
+    if (apiOn !== true) return;
+    const t = setInterval(loadClaims, 20000); // near-real-time cross-user sync
+    return () => clearInterval(t);
+  }, [apiOn]);
+
   const claimOf = (id) => claims[id] || null; // claims persist until released
   const canClaim = me && (me.role === "setter" || me.role === "admin");
-  const saveClaim = (id, claim) => setClaims((p) => ({ ...p, [id]: claim })); // PROD: POST to shared store
-  const claimFor = (user) => ({ by: user.email, byName: user.name, initials: user.initials, at: now });
-  const doClaim = (id) => { if (canClaim) saveClaim(id, claimFor(me)); };
-  const doRelease = (id) => setClaims((p) => { const n = { ...p }; delete n[id]; return n; });
-  const assignMany = (ids, user) =>
-    setClaims((p) => { const n = { ...p }; ids.forEach((id) => { n[id] = claimFor(user); }); return n; });
+  const claimFor = (user) => ({ by: user.email, byName: user.name, initials: user.initials, at: Date.now() });
+
+  const doClaim = async (id) => {
+    if (!canClaim) return;
+    const claim = claimFor(me);
+    setClaims((p) => ({ ...p, [id]: claim })); // optimistic
+    if (apiOn) {
+      try {
+        const r = await fetch(CLAIMS_API, {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ leadId: id, ...claim, force: false }),
+        });
+        const data = await r.json();
+        if (data?.claims) setClaims((p) => ({ ...p, ...data.claims })); // reflects a conflicting owner
+      } catch { /* keep optimistic */ }
+    }
+  };
+  const doRelease = async (id) => {
+    setClaims((p) => { const n = { ...p }; delete n[id]; return n; });
+    if (apiOn) { try { await fetch(`${CLAIMS_API}/${id}`, { method: "DELETE" }); } catch {} }
+  };
+  const assignMany = async (ids, user) => {
+    const c = claimFor(user);
+    setClaims((p) => { const n = { ...p }; ids.forEach((id) => { n[id] = c; }); return n; });
+    if (apiOn) {
+      try {
+        await fetch(CLAIMS_API, {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ assignments: ids.map((id) => ({ leadId: id, ...c })), force: true }),
+        });
+        loadClaims();
+      } catch {}
+    }
+  };
 
   // enrich + eligibility filter
   const eligible = useMemo(() => {
@@ -419,7 +483,7 @@ export default function AppointmentSetterBoard() {
       if (isSLead(r)) return false;               // drop sLeads
       if (String(r.relead || "").trim().toLowerCase() === "y") return false; // drop releads
       if (isLost(r)) return false;                // drop lost
-      if (pastApptStage(r)) return false;         // drop Set Appt or any later milestone
+      if (quotedNoAppt(r)) return false;          // quoted/letter but no appt — still hidden
       if (isDuggan(r)) return false;              // drop EM Duggan partner channel
       if (isJunkName(r)) return false;            // drop Yelp / brand / corporate placeholder records
       if (EXCLUDED_ACCOUNT_CLASSES.includes(String(r.account_class || "").trim().toLowerCase())) return false; // drop prospects/customers
@@ -456,6 +520,36 @@ export default function AppointmentSetterBoard() {
     ["14d", "> 14 days"],
     ["30d", "> 30 days"],
   ];
+  // Lead-in supports both directions (fresh "within" and stale "older than").
+  const inLeadWindow = (hrs, win) => {
+    if (win === "any") return true;
+    if (hrs == null) return false;
+    const m = { w24h: ["<", 24], w3d: ["<", 72], w7d: ["<", 168], w14d: ["<", 336], o7d: [">", 168], o30d: [">", 720] }[win];
+    return m ? (m[0] === "<" ? hrs <= m[1] : hrs > m[1]) : true;
+  };
+  const LEAD_WIN_OPTS = [
+    ["any", "Any time"],
+    ["w24h", "Within 24 hrs"],
+    ["w3d", "Within 3 days"],
+    ["w7d", "Within 7 days"],
+    ["w14d", "Within 14 days"],
+    ["o7d", "Older than 7 days"],
+    ["o30d", "Older than 30 days"],
+  ];
+  const ASSIGN_WIN_OPTS = [
+    ["any", "Any time"],
+    ["24h", "Last 24 hrs"],
+    ["7d", "Last 7 days"],
+    ["30d", "Last 30 days"],
+    ["90d", "Last 90 days"],
+  ];
+  // Assignment-date window (by claim.at) — lets admins scope stats to a period.
+  const inAssignWin = (atMs) => {
+    if (assignWin === "any") return true;
+    if (!atMs) return false;
+    const days = { "24h": 1, "7d": 7, "30d": 30, "90d": 90 }[assignWin];
+    return (now - atMs) <= days * 24 * 3.6e6;
+  };
 
   // All row-level filters EXCEPT the age segment and the category tab. Counts derive
   // from this so the tab totals (and age-segment totals) reflect the active filters.
@@ -464,13 +558,18 @@ export default function AppointmentSetterBoard() {
     return eligible.filter((r) => {
       if (teamF !== "all" && r.team !== teamF) return false;
       if (branchF !== "all" && r.branch !== branchF) return false;
-      if (repF !== "all" && r.repName !== repF) return false;
+      if (repExcluded.has(r.repName)) return false;
       if (!inWindow(r.hoursSinceTouch, touchWin)) return false;
-      if (!inWindow((now - r.leadInMs) / 3.6e6, leadWin)) return false;
+      if (!inLeadWindow((now - r.leadInMs) / 3.6e6, leadWin)) return false;
       if (qlc && !r.searchBlob.includes(qlc)) return false;
+      if (claimedByF !== "all") {
+        const c = claims[r.leads_id];
+        if (claimedByF === "unclaimed" ? !!c : c?.by !== claimedByF) return false;
+      }
+      if (assignWin !== "any") { const c = claims[r.leads_id]; if (c && !inAssignWin(c.at)) return false; }
       return true;
     });
-  }, [eligible, teamF, branchF, repF, touchWin, leadWin, q, now]);
+  }, [eligible, teamF, branchF, repExcluded, touchWin, leadWin, q, now, claimedByF, claims, assignWin]);
 
   const ageTotals = useMemo(() => {
     const t = { fresh: 0, aged: 0 };
@@ -480,33 +579,131 @@ export default function AppointmentSetterBoard() {
   const segFiltered = useMemo(() => baseFiltered.filter((r) => r.ageBucket === ageSeg), [baseFiltered, ageSeg]);
 
   const counts = useMemo(() => {
-    const c = { nocontact: 0, attempted: 0, contacted: 0, mine: 0 };
+    const c = { noattempt: 0, attempted: 0, apptmade: 0, mine: 0 };
     segFiltered.forEach((r) => { c[r.category]++; if (claimOf(r.leads_id)?.by === me?.email) c.mine++; });
     return c;
   }, [segFiltered, claims, now, me?.email]);
+
+  // Admin setter-queue analytics. Computed from the RAW feed (not `eligible`) joined
+  // to claims, so opps that had an appointment set — which leave the working board —
+  // are still counted. "Setter touch" = a comment authored by the assigned setter.
+  const recById = useMemo(() => {
+    const m = new Map();
+    (records || []).forEach((r) => m.set(String(r.leads_id), r));
+    return m;
+  }, [records]);
+
+  const setterTouched = (rec, setterName) => {
+    const key = repKey(setterName);
+    return parseComments(rec.comments).lines.some((l) => l.who && repKey(l.who) === key);
+  };
+
+  // Eligible lead → category, for "active assigned" (workable = eligible and not appt-made).
+  const eligibleCatById = useMemo(() => {
+    const m = new Map();
+    eligible.forEach((r) => m.set(String(r.leads_id), r.category));
+    return m;
+  }, [eligible]);
+  const isActive = (leadId) => {
+    const cat = eligibleCatById.get(String(leadId));
+    return !!cat && cat !== "apptmade";
+  };
+
+  const setterQueues = useMemo(() => {
+    const map = new Map();
+    Object.entries(claims).forEach(([leadId, c]) => {
+      if (!inAssignWin(c.at)) return; // scope to assignment-date window
+      const rec = recById.get(String(leadId));
+      const e = map.get(c.by) || { name: c.byName, initials: c.initials, total: 0, active: 0, noTouch: 0, apptBySetter: 0, apptByField: 0 };
+      e.total++;
+      if (isActive(leadId)) e.active++;
+      if (rec) {
+        if (!setterTouched(rec, c.byName)) e.noTouch++;
+        if (hasApptSet(rec)) {
+          if (apptSetByAuthor(rec, c.byName)) e.apptBySetter++;
+          else e.apptByField++;
+        }
+      }
+      map.set(c.by, e);
+    });
+    return [...map.entries()].map(([email, v]) => ({ email, ...v })).sort((a, b) => b.total - a.total);
+  }, [claims, recById, eligibleCatById, assignWin, now]);
+  const pct = (n, d) => (d ? Math.round((n / d) * 100) : 0) + "%";
+
+  // When one setter is selected, reconcile their Assigned total to what's on the board.
+  const selSetter = (claimedByF !== "all" && claimedByF !== "unclaimed") ? claimedByF : null;
+  const recon = useMemo(() => {
+    if (!selSetter) return null;
+    const ids = Object.entries(claims)
+      .filter(([, c]) => c.by === selSetter && inAssignWin(c.at)).map(([id]) => String(id));
+    const byId = new Map(eligible.map((r) => [String(r.leads_id), r]));
+    const cat = { noattempt: 0, attempted: 0, apptmade: 0 };
+    let open = 0;
+    ids.forEach((id) => { const er = byId.get(id); if (er) { open++; cat[er.category]++; } });
+    const total = ids.length;
+    const name = setterQueues.find((s) => s.email === selSetter)?.name || selSetter;
+    return { name, total, open, cat, other: Math.max(0, total - open) };
+  }, [selSetter, claims, eligible, setterQueues, assignWin, now]);
 
   const rows = useMemo(() => {
     let list = segFiltered.filter((r) => {
       if (tab === "mine") return claimOf(r.leads_id)?.by === me?.email;
       return r.category === tab;
     });
-    const cmp = {
-      newest: (a, b) => b.lead_date_in.localeCompare(a.lead_date_in),
-      oldest: (a, b) => a.lead_date_in.localeCompare(b.lead_date_in),
-      touches: (a, b) => b.touches - a.touches,
-      stale: (a, b) => (b.hoursSinceTouch ?? 0) - (a.hoursSinceTouch ?? 0),
-    }[sort];
+    // Click-to-sort columns. Nulls always sink to the bottom regardless of direction.
+    const val = {
+      touches: (r) => r.touches,
+      since: (r) => r.hoursSinceTouch,
+      leadin: (r) => r.leadInMs,
+    }[sortKey];
+    const dir = sortDir === "desc" ? 1 : -1;
+    const cmp = (a, b) => {
+      const av = val(a), bv = val(b);
+      if (av == null && bv == null) return 0;
+      if (av == null) return 1;
+      if (bv == null) return -1;
+      return (bv - av) * dir;
+    };
     return [...list].sort(cmp);
-  }, [segFiltered, tab, sort, claims, now, me?.email]);
+  }, [segFiltered, tab, sortKey, sortDir, claims, now, me?.email]);
 
-  useEffect(() => setPage(0), [tab, teamF, branchF, repF, touchWin, leadWin, q, sort, ageSeg]);
-  useEffect(() => setSel(new Set()), [tab, teamF, branchF, repF, touchWin, leadWin, q, sort, ageSeg, page]);
-  const pages = Math.max(1, Math.ceil(rows.length / PAGE));
-  const pageRows = showAll ? rows : rows.slice(page * PAGE, page * PAGE + PAGE);
+  const toggleSort = (key) => {
+    if (key === sortKey) setSortDir((d) => (d === "desc" ? "asc" : "desc"));
+    else { setSortKey(key); setSortDir("desc"); }
+  };
+  const sortArrow = (key) => (key === sortKey ? (sortDir === "desc" ? " ↓" : " ↑") : "");
+
+  // Drill-down: click a Setter Queues metric to see exactly those leads (across categories,
+  // including opps that dropped off the normal board view). Built from raw records + claims.
+  const METRIC_LABEL = { active: "active (workable)", notouch: "no setter touch", apptsetter: "appt by setter", apptfield: "appt by field rep" };
+  const drillRows = useMemo(() => {
+    if (!drill) return null;
+    const out = [];
+    Object.entries(claims).forEach(([leadId, c]) => {
+      if (c.by !== drill.by || !inAssignWin(c.at)) return;
+      const rec = recById.get(String(leadId));
+      if (!rec) return;
+      let keep = true;
+      if (drill.metric === "active") keep = isActive(leadId);
+      else if (drill.metric === "notouch") keep = !setterTouched(rec, c.byName);
+      else if (drill.metric === "apptsetter") keep = hasApptSet(rec) && apptSetByAuthor(rec, c.byName);
+      else if (drill.metric === "apptfield") keep = hasApptSet(rec) && !apptSetByAuthor(rec, c.byName);
+      if (keep) out.push(enrich(rec, now));
+    });
+    return out.sort((a, b) => (b.leadInMs || 0) - (a.leadInMs || 0));
+  }, [drill, claims, recById, eligibleCatById, now, assignWin]);
+  const drillName = drill ? (setterQueues.find((s) => s.email === drill.by)?.name || drill.by) : "";
+
+  const displayRows = drill ? drillRows : rows;
+
+  useEffect(() => setPage(0), [tab, teamF, branchF, repExcluded, touchWin, leadWin, assignWin, q, sortKey, sortDir, ageSeg, claimedByF, drill]);
+  useEffect(() => setSel(new Set()), [tab, teamF, branchF, repExcluded, touchWin, leadWin, assignWin, q, sortKey, sortDir, ageSeg, claimedByF, drill, page]);
+  const pages = Math.max(1, Math.ceil(displayRows.length / PAGE));
+  const pageRows = showAll ? displayRows : displayRows.slice(page * PAGE, page * PAGE + PAGE);
   const toggleSel = (id) => setSel((s) => { const n = new Set(s); n.has(id) ? n.delete(id) : n.add(id); return n; });
 
   const exportCSV = () => {
-    const catLabel = { nocontact: "No contact", attempted: "Attempted · no success", contacted: "Contacted · no appt" };
+    const catLabel = { noattempt: "No contact attempted", attempted: "Contact attempted", apptmade: "Appointment made" };
     const cols = [
       ["Lead ID", (r) => r.leads_id],
       ["Customer", (r) => r.account_name],
@@ -523,7 +720,7 @@ export default function AppointmentSetterBoard() {
     ];
     const esc = (v) => `"${String(v ?? "").replace(/\r?\n/g, " ").replace(/"/g, '""')}"`;
     const csv = [cols.map((c) => esc(c[0])).join(",")]
-      .concat(rows.map((r) => cols.map((c) => esc(c[1](r))).join(",")))
+      .concat(displayRows.map((r) => cols.map((c) => esc(c[1](r))).join(",")))
       .join("\r\n");
     const blob = new Blob(["\ufeff" + csv], { type: "text/csv;charset=utf-8;" });
     const url = URL.createObjectURL(blob);
@@ -563,7 +760,21 @@ export default function AppointmentSetterBoard() {
       {/* Header */}
       <header className="asb-head">
         <div className="asb-brand">
-          <span className="asb-drop" />
+          <span className="asb-gem" aria-label="White Stone">
+            <svg viewBox="0 0 32 32" width="30" height="30" xmlns="http://www.w3.org/2000/svg">
+              <defs>
+                <linearGradient id="asbGemFace" x1="0" y1="0" x2="0" y2="1">
+                  <stop offset="0" stopColor="#ffffff" />
+                  <stop offset="1" stopColor="#dfe6ef" />
+                </linearGradient>
+              </defs>
+              <polygon points="16,2 27,12 16,30 5,12" fill="url(#asbGemFace)" stroke="#9fb2c6" strokeWidth="1" strokeLinejoin="round" />
+              <polygon points="5,12 27,12 16,30" fill="#eef2f7" opacity="0.9" />
+              <polygon points="16,2 21.5,12 16,30 10.5,12" fill="#ffffff" opacity="0.75" />
+              <path d="M5,12 L11,12 L16,2 Z" fill="#ffffff" opacity="0.95" />
+              <path d="M16,2 L27,12 M5,12 L27,12 M10.5,12 L16,30 M21.5,12 L16,30" stroke="#b9c6d6" strokeWidth="0.6" fill="none" />
+            </svg>
+          </span>
           <div>
             <h1>Appointment Setter Board</h1>
             <p>Residential leads the field rep didn't reach in time — claim, dial, set the appointment.</p>
@@ -592,6 +803,12 @@ export default function AppointmentSetterBoard() {
               <span>{me?.name}</span>
               <span className="asb-role">{me?.role}</span>
             </div>
+          )}
+          {apiOn === false && (
+            <span className="asb-sync local" title="Claims are local to this browser — the shared store isn't reachable">● local</span>
+          )}
+          {apiOn === true && (
+            <span className="asb-sync live" title="Claims are shared across the team in real time">● synced</span>
           )}
         </div>
       </header>
@@ -625,13 +842,60 @@ export default function AppointmentSetterBoard() {
         </div>
         <Seg label="Team" value={teamF} onChange={setTeamF} opts={[["all", "All"], ["Field", "Field"], ["NST", "NST"]]} />
         <Pick label="Branch" value={branchF} onChange={setBranchF} opts={[["all", "All branches"], ...branches.map((b) => [b, b])]} />
-        <Pick label="Rep" value={repF} onChange={setRepF} opts={[["all", "All reps"], ...reps.map((r) => [r, r])]} />
+        <MultiSelect label="Rep" options={reps} excluded={repExcluded}
+          onToggle={(r) => setRepExcluded((s) => { const n = new Set(s); n.has(r) ? n.delete(r) : n.add(r); return n; })}
+          onAll={() => setRepExcluded(new Set())}
+          onNone={() => setRepExcluded(new Set(reps))} />
         <Pick label="Since touch" value={touchWin} onChange={setTouchWin} opts={WIN_OPTS} />
-        <Pick label="Lead in" value={leadWin} onChange={setLeadWin} opts={WIN_OPTS} />
-        <Pick label="Sort" value={sort} onChange={setSort} opts={[["newest", "Newest lead in"], ["oldest", "Oldest lead in"], ["touches", "Most touches"], ["stale", "Longest since touch"]]} />
+        <Pick label="Lead in" value={leadWin} onChange={setLeadWin} opts={LEAD_WIN_OPTS} />
+        {isAdmin && <Pick label="Assigned" value={assignWin} onChange={setAssignWin} opts={ASSIGN_WIN_OPTS} />}
+        <Pick label="Claimed by" value={claimedByF} onChange={setClaimedByF}
+          opts={[["all", "Anyone"], ["unclaimed", "Unclaimed"],
+            ...Object.entries(ACCESS_MAP).map(([em, u]) => [em, u.role === "admin" ? `${u.name} (admin)` : u.name])]} />
       </div>
 
       {isAdmin && <FieldDiag records={records} />}
+
+      {/* Admin: setter queue review */}
+      {isAdmin && setterQueues.length > 0 && (
+        <div className="asb-sq">
+          <div className="asb-sq-head">
+            <Shield size={12} /> Setter queues
+            <span>· per setter: opps assigned, how many the setter hasn't touched, and appointments set by the setter vs by the field rep</span>
+          </div>
+          <div className="asb-sq-table">
+            <div className="asb-sq-row asb-sq-th">
+              <div>Setter</div><div>Assigned</div><div>Active</div><div>No setter touch</div><div>Appt by setter</div><div>Appt by field rep</div>
+            </div>
+            {setterQueues.map((s) => (
+              <div key={s.email} className={`asb-sq-row ${claimedByF === s.email ? "on" : ""}`}
+                onClick={() => setClaimedByF(claimedByF === s.email ? "all" : s.email)}
+                title={`Filter the board to ${s.name}'s open opps`}>
+                <div className="asb-sq-name"><span className="asb-av">{s.initials}</span>{s.name}</div>
+                <div className="asb-sq-num" onClick={(e) => { e.stopPropagation(); setDrill(null); setClaimedByF(s.email); }}><b>{s.total}</b></div>
+                <div className="asb-sq-num" onClick={(e) => { e.stopPropagation(); setClaimedByF(s.email); setDrill({ by: s.email, metric: "active" }); }}><b className="asb-active">{s.active}</b> <span className="asb-sq-pct">({pct(s.active, s.total)})</span></div>
+                <div className="asb-sq-num" onClick={(e) => { e.stopPropagation(); setClaimedByF(s.email); setDrill({ by: s.email, metric: "notouch" }); }}>{s.noTouch} <span className="asb-sq-pct">({pct(s.noTouch, s.total)})</span></div>
+                <div className="asb-sq-num" onClick={(e) => { e.stopPropagation(); setClaimedByF(s.email); setDrill({ by: s.email, metric: "apptsetter" }); }}>{s.apptBySetter} <span className="asb-sq-pct">({pct(s.apptBySetter, s.total)})</span></div>
+                <div className="asb-sq-num" onClick={(e) => { e.stopPropagation(); setClaimedByF(s.email); setDrill({ by: s.email, metric: "apptfield" }); }}>{s.apptByField} <span className="asb-sq-pct">({pct(s.apptByField, s.total)})</span></div>
+              </div>
+            ))}
+          </div>
+          <div className="asb-sq-note">
+            <b>Assigned</b> is every opp claimed by the setter{assignWin !== "any" ? " in the selected window" : ""}. <b>Active</b> is only the ones still workable — it excludes appointments already made and opps not shown on the board (quoted, lost, or no longer in the feed). "Appt by setter" vs "by field rep" is inferred from who logged the appointment. <b>Click any number</b> to see those exact leads below; click a setter's name to filter the board to them.
+          </div>
+        </div>
+      )}
+
+      {/* Per-setter reconciliation: assigned = open + appt set + other */}
+      {recon && !drill && (
+        <div className="asb-recon">
+          <b>{recon.name}</b> · <b>{recon.total}</b> assigned ={" "}
+          <span className="asb-recon-open">{recon.open} shown below</span>
+          <span className="asb-recon-cat">({recon.cat.noattempt} no contact · {recon.cat.attempted} attempted · {recon.cat.apptmade} appt made)</span>
+          {recon.other > 0 && <> + <span className="asb-recon-other">{recon.other} not shown (quoted / lost / not in feed)</span></>}
+          <button className="asb-recon-clear" onClick={() => setClaimedByF("all")}>clear</button>
+        </div>
+      )}
 
       {/* Age segment — field rep gets the first hour; team works the older pool */}
       <div className="asb-age">
@@ -646,7 +910,7 @@ export default function AppointmentSetterBoard() {
       {/* Tabs */}
       <nav className="asb-tabs">
         {TABS.map((t) => (
-          <button key={t.id} className={`asb-tab ${tab === t.id ? "on" : ""}`} onClick={() => setTab(t.id)}>
+          <button key={t.id} className={`asb-tab ${tab === t.id ? "on" : ""}`} onClick={() => { setDrill(null); setTab(t.id); }}>
             {t.label}<span className="asb-count">{counts[t.id]}</span>
             <span className="asb-info" onClick={(e) => e.stopPropagation()}>
               <Info size={12} />
@@ -681,6 +945,14 @@ export default function AppointmentSetterBoard() {
         </div>
       )}
 
+      {/* Drill-down banner */}
+      {drill && (
+        <div className="asb-drill">
+          Showing <b>{drillName}</b> · <b>{drillRows.length}</b> {METRIC_LABEL[drill.metric]} — these exact leads, across all categories.
+          <button className="asb-drill-clear" onClick={() => setDrill(null)}>← back to board</button>
+        </div>
+      )}
+
       {/* Table */}
       <div className={`asb-table ${isAdmin ? "asb-admin" : ""}`}>
         <div className="asb-tr asb-th">
@@ -690,10 +962,10 @@ export default function AppointmentSetterBoard() {
           <div className="c-lid">Lead ID</div>
           <div className="c-rep">Rep · Branch</div>
           <div className="c-ms">Milestone</div>
-          <div className="c-num">Touches</div>
-          <div className="c-num">Time since last touch</div>
+          <div className={`c-num asb-sortable ${sortKey === "touches" ? "on" : ""}`} onClick={() => toggleSort("touches")} title="Click to sort">Touches{sortArrow("touches")}</div>
+          <div className={`c-num asb-sortable ${sortKey === "since" ? "on" : ""}`} onClick={() => toggleSort("since")} title="Click to sort">Time since last touch{sortArrow("since")}</div>
           <div className="c-cmt">Last comment</div>
-          <div className="c-date">Lead in</div>
+          <div className={`c-date asb-sortable ${sortKey === "leadin" ? "on" : ""}`} onClick={() => toggleSort("leadin")} title="Click to sort">Lead in{sortArrow("leadin")}</div>
           <div className="c-act"></div>
         </div>
 
@@ -802,9 +1074,9 @@ export default function AppointmentSetterBoard() {
       {/* Comment hover panel */}
       {hover && (
         <div className="asb-pop" style={{ left: Math.min(hover.x + 16, window.innerWidth - 440), top: Math.min(hover.y + 12, window.innerHeight - 320) }}>
-          <div className="asb-pop-head">{hover.rec.account_name} · #{hover.rec.leads_id} · {hover.rec.lines.length} entries</div>
+          <div className="asb-pop-head">{hover.rec.account_name} · #{hover.rec.leads_id} · {hover.rec.lines.length} entries · newest first</div>
           <div className="asb-pop-body">
-            {hover.rec.lines.map((l, i) => (
+            {[...hover.rec.lines].reverse().map((l, i) => (
               <div className="asb-pop-line" key={i}>
                 {l.ts && <span className="asb-pop-ts">{l.ts}</span>}
                 {l.who && <span className="asb-pop-who">{l.who}</span>}
@@ -840,6 +1112,38 @@ function Pick({ label, value, onChange, opts }) {
     </label>
   );
 }
+function MultiSelect({ label, options, excluded, onToggle, onAll, onNone }) {
+  const [open, setOpen] = useState(false);
+  const selected = options.length - options.filter((o) => excluded.has(o)).length;
+  const allSel = selected === options.length;
+  return (
+    <div className="asb-ms-wrap">
+      <span className="asb-pick-lbl">{label}</span>
+      <button className="asb-ms-btn" onClick={() => setOpen((o) => !o)}>
+        {allSel ? "All" : `${selected} of ${options.length}`} <span className="asb-ms-caret">▾</span>
+      </button>
+      {open && (
+        <>
+          <div className="asb-ms-backdrop" onClick={() => setOpen(false)} />
+          <div className="asb-ms-menu">
+            <div className="asb-ms-actions">
+              <button onClick={onAll}>Select all</button>
+              <button onClick={onNone}>Clear all</button>
+            </div>
+            <div className="asb-ms-list">
+              {options.map((o) => (
+                <label key={o} className="asb-ms-opt">
+                  <input type="checkbox" checked={!excluded.has(o)} onChange={() => onToggle(o)} />
+                  {o}
+                </label>
+              ))}
+            </div>
+          </div>
+        </>
+      )}
+    </div>
+  );
+}
 
 const CSS = `
 .asb{--ink:#111722;--muted:#697586;--line:#e4e8ee;--surface:#fff;--bg:#f5f7fa;
@@ -851,7 +1155,7 @@ const CSS = `
 
 .asb-head{display:flex;justify-content:space-between;align-items:flex-start;gap:16px;margin-bottom:16px;}
 .asb-brand{display:flex;gap:12px;align-items:flex-start;}
-.asb-drop{width:30px;height:30px;border-radius:50% 50% 50% 0;background:linear-gradient(150deg,#22d3ee,#0d9488);transform:rotate(-45deg);flex:none;margin-top:2px;box-shadow:0 2px 8px rgba(13,148,136,.35);}
+.asb-gem{flex:none;margin-top:2px;display:inline-flex;filter:drop-shadow(0 2px 5px rgba(120,140,170,.35));}
 .asb-brand h1{font-size:18px;font-weight:680;margin:0;letter-spacing:-.01em;}
 .asb-brand p{margin:2px 0 0;color:var(--muted);font-size:12px;}
 .asb-head-right{display:flex;gap:8px;align-items:center;}
@@ -861,6 +1165,9 @@ const CSS = `
 .asb-user select{border:none;background:none;font:inherit;color:var(--ink);outline:none;cursor:pointer;}
 .asb-signed{display:flex;align-items:center;gap:6px;background:var(--surface);border:1px solid var(--line);border-radius:8px;padding:6px 11px;color:var(--ink);font-size:12px;font-weight:560;}
 .asb-signed .asb-role{font-size:9.5px;text-transform:uppercase;letter-spacing:.04em;background:#eef1f6;color:var(--slate);border-radius:5px;padding:1px 6px;font-weight:680;}
+.asb-sync{font-size:11px;font-weight:560;display:inline-flex;align-items:center;padding:5px 9px;border-radius:8px;border:1px solid var(--line);}
+.asb-sync.live{color:var(--teal);background:#f0fdfa;border-color:#ccf0ea;}
+.asb-sync.local{color:var(--amber);background:#fff7ed;border-color:#fde8cf;}
 .asb-open{font-size:11px;color:var(--muted);font-style:italic;}
 
 .asb-controls{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:14px;}
@@ -874,6 +1181,28 @@ const CSS = `
 .asb-seg button.on{background:var(--ink);color:#fff;}
 .asb-pick{display:flex;align-items:center;gap:7px;color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.04em;}
 .asb-pick select{background:var(--surface);border:1px solid var(--line);border-radius:9px;padding:7px 10px;font:inherit;text-transform:none;letter-spacing:0;color:var(--ink);cursor:pointer;font-size:12px;}
+
+.asb-ms-wrap{position:relative;display:flex;align-items:center;gap:7px;}
+.asb-pick-lbl{color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.04em;}
+.asb-ms-btn{background:var(--surface);border:1px solid var(--line);border-radius:9px;padding:7px 11px;font:inherit;font-size:12px;color:var(--ink);cursor:pointer;display:flex;align-items:center;gap:6px;}
+.asb-ms-caret{color:var(--muted);font-size:10px;}
+.asb-ms-backdrop{position:fixed;inset:0;z-index:40;}
+.asb-ms-menu{position:absolute;top:calc(100% + 6px);left:0;z-index:41;background:#fff;border:1px solid var(--line);border-radius:10px;box-shadow:0 10px 30px rgba(17,23,34,.16);width:230px;padding:8px;}
+.asb-ms-actions{display:flex;gap:6px;padding-bottom:8px;margin-bottom:6px;border-bottom:1px solid var(--line);}
+.asb-ms-actions button{flex:1;background:#f5f7fa;border:1px solid var(--line);border-radius:7px;padding:5px;font:inherit;font-size:11px;color:var(--slate);cursor:pointer;}
+.asb-ms-actions button:hover{border-color:var(--indigo);color:var(--indigo);}
+.asb-ms-list{max-height:260px;overflow:auto;}
+.asb-ms-opt{display:flex;align-items:center;gap:8px;padding:5px 6px;font-size:12.5px;color:var(--ink);cursor:pointer;border-radius:6px;}
+.asb-ms-opt:hover{background:#f7f8fa;}
+.asb-ms-opt input{width:14px;height:14px;cursor:pointer;}
+
+.asb-recon{display:flex;align-items:center;gap:6px;flex-wrap:wrap;background:#eef2ff;border:1px solid #d6dcff;border-radius:9px;padding:9px 13px;margin-top:10px;font-size:12.5px;color:var(--slate);}
+.asb-recon b{color:var(--ink);}
+.asb-recon-open{color:var(--teal);font-weight:560;}
+.asb-recon-appt{color:var(--indigo);font-weight:560;}
+.asb-recon-other{color:var(--amber);font-weight:560;}
+.asb-recon-cat{color:var(--muted);font-size:11.5px;}
+.asb-recon-clear{margin-left:auto;background:none;border:none;color:var(--muted);font:inherit;font-size:12px;cursor:pointer;text-decoration:underline;}
 
 .asb-tabs{display:flex;gap:4px;border-bottom:1px solid var(--line);margin-bottom:2px;}
 .asb-tab{border:none;background:none;padding:10px 14px;font:inherit;font-weight:560;color:var(--muted);cursor:pointer;border-bottom:2px solid transparent;margin-bottom:-1px;display:flex;align-items:center;gap:8px;}
@@ -894,6 +1223,32 @@ const CSS = `
 .asb-table.asb-admin .asb-tr{grid-template-columns:30px 116px 1.1fr 72px 1.15fr .8fr 62px 116px 1.6fr 80px 74px;min-width:1100px;}
 .asb-tr:last-child{border-bottom:none;}
 .asb-th{background:#fafbfc;color:var(--muted);font-size:10.5px;text-transform:uppercase;letter-spacing:.05em;font-weight:620;padding-top:9px;padding-bottom:9px;}
+.asb-sortable{cursor:pointer;user-select:none;}
+.asb-sortable:hover{color:var(--indigo);}
+.asb-sortable.on{color:var(--indigo);}
+.asb-sq{background:#fff;border:1px solid var(--line);border-radius:11px;padding:12px 14px;margin-top:10px;}
+.asb-sq-head{display:flex;align-items:center;gap:6px;font-size:11px;font-weight:680;text-transform:uppercase;letter-spacing:.04em;color:var(--indigo);margin-bottom:9px;}
+.asb-sq-head span{font-weight:450;text-transform:none;letter-spacing:0;color:var(--muted);font-size:11.5px;}
+.asb-sq-table{border:1px solid var(--line);border-radius:9px;overflow:hidden;}
+.asb-sq-row{display:grid;grid-template-columns:1.5fr .7fr .8fr 1fr 1fr 1fr;gap:10px;align-items:center;padding:8px 12px;border-bottom:1px solid var(--line);font-size:12.5px;cursor:pointer;}
+.asb-sq-row:last-child{border-bottom:none;}
+.asb-sq-row:not(.asb-sq-th):hover{background:#f7f8fa;}
+.asb-sq-row.on{background:#eef2ff;}
+.asb-sq-th{background:#fafbfc;font-size:10.5px;text-transform:uppercase;letter-spacing:.04em;font-weight:620;color:var(--muted);cursor:default;}
+.asb-sq-th:hover{background:#fafbfc;}
+.asb-sq-name{display:flex;align-items:center;gap:8px;font-weight:560;}
+.asb-sq-name .asb-av{width:22px;height:22px;border-radius:50%;background:var(--slate);color:#fff;font-size:9.5px;font-weight:680;display:inline-flex;align-items:center;justify-content:center;}
+.asb-sq-row.on .asb-sq-name .asb-av{background:var(--indigo);}
+.asb-sq-row b{font-family:ui-monospace,Menlo,monospace;}
+.asb-sq-pct{color:var(--muted);font-size:11px;}
+.asb-sq-num{cursor:pointer;border-radius:6px;padding:2px 4px;margin:-2px -4px;}
+.asb-sq-num:hover{background:#eef2ff;color:var(--indigo);}
+.asb-active{color:var(--teal);}
+.asb-drill{display:flex;align-items:center;gap:6px;flex-wrap:wrap;background:#0e1217;color:#fff;border-radius:9px;padding:9px 13px;margin-top:10px;font-size:12.5px;}
+.asb-drill b{color:#fff;}
+.asb-drill-clear{margin-left:auto;background:rgba(255,255,255,.14);border:none;color:#fff;font:inherit;font-size:12px;cursor:pointer;border-radius:7px;padding:4px 10px;}
+.asb-drill-clear:hover{background:rgba(255,255,255,.24);}
+.asb-sq-note{font-size:11px;color:var(--muted);margin-top:8px;line-height:1.5;}
 .asb-tr.is-mine{background:#f6f5ff;}
 .asb-tr.is-locked{background:#fbfbfc;}
 .asb-tr.is-sel{background:#eff6ff;}
