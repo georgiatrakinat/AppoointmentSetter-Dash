@@ -118,7 +118,7 @@ const ACCESS_MAP = {
   "jsequera@lifesourcewater.com": { name: "Juan Sequera", initials: "JS", role: "setter" },
   "alexi@lifesourcewater.com": { name: "Alexi Martin", initials: "AM", role: "setter" },
   "diego@lifesourcewater.com": { name: "Diego Soc Domingo", initials: "DD", role: "setter" },
-  "dcerrato@lifesourcewater.com": { name: "Daniel Cerrato", initials: "DC", role: "setter" },
+  "evelyn@lifesourcewater.com": { name: "Evelyn Hernandez", initials: "EH", role: "setter" },
   "amunoz@lifesourcewater.com": { name: "Angelo Granada", initials: "AG", role: "setter" },
   // Admins — see everything, release/extend any claim
   "georgia@lifesourcewater.com": { name: "Georgia Harris", initials: "GH", role: "admin" },
