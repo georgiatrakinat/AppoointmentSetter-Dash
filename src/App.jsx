@@ -116,7 +116,7 @@ const ACCESS_MAP = {
   "fabio@lifesourcewater.com": { name: "Fabio Davila", initials: "FD", role: "setter" },
   "lisa@lifesourcewater.com": { name: "Lisa Porras", initials: "LP", role: "setter" },
   "jsequera@lifesourcewater.com": { name: "Juan Sequera", initials: "JS", role: "setter" },
-  "alexi@lifesourcewater.com": { name: "Alexi Martin", initials: "AM", role: "setter" },
+  "genesis@lifesourcewater.com": { name: "Gen Mieja", initials: "GM", role: "setter" },
   "diego@lifesourcewater.com": { name: "Diego Soc Domingo", initials: "DD", role: "setter" },
   "evelyn@lifesourcewater.com": { name: "Evelyn Hernandez", initials: "EH", role: "setter" },
   "amunoz@lifesourcewater.com": { name: "Angelo Granada", initials: "AG", role: "setter" },
@@ -461,6 +461,13 @@ export default function AppointmentSetterBoard() {
   const doRelease = async (id) => {
     setClaims((p) => { const n = { ...p }; delete n[id]; return n; });
     if (apiOn) { try { await fetch(`${CLAIMS_API}/${id}`, { method: "DELETE" }); } catch {} }
+  };
+  const releaseAllFor = async (email, name) => {
+    const ids = Object.entries(claims).filter(([, c]) => c.by === email).map(([id]) => id);
+    if (!ids.length) return;
+    if (!window.confirm(`Release all ${ids.length} opp${ids.length !== 1 ? "s" : ""} claimed by ${name}? They go back into the pool for anyone to claim.`)) return;
+    setClaims((p) => { const n = { ...p }; ids.forEach((id) => delete n[id]); return n; }); // optimistic
+    if (apiOn) { for (const id of ids) { try { await fetch(`${CLAIMS_API}/${id}`, { method: "DELETE" }); } catch {} } }
   };
   const assignMany = async (ids, user) => {
     const c = claimFor(user);
@@ -871,7 +878,11 @@ export default function AppointmentSetterBoard() {
               <div key={s.email} className={`asb-sq-row ${claimedByF === s.email ? "on" : ""}`}
                 onClick={() => setClaimedByF(claimedByF === s.email ? "all" : s.email)}
                 title={`Filter the board to ${s.name}'s open opps`}>
-                <div className="asb-sq-name"><span className="asb-av">{s.initials}</span>{s.name}</div>
+                <div className="asb-sq-name">
+                  <span className="asb-av">{s.initials}</span>{s.name}
+                  <button className="asb-sq-release" title={`Release all of ${s.name}'s claimed opps back to the pool`}
+                    onClick={(e) => { e.stopPropagation(); releaseAllFor(s.email, s.name); }}>Release all</button>
+                </div>
                 <div className="asb-sq-num" onClick={(e) => { e.stopPropagation(); setDrill(null); setClaimedByF(s.email); }}><b>{s.total}</b></div>
                 <div className="asb-sq-num" onClick={(e) => { e.stopPropagation(); setClaimedByF(s.email); setDrill({ by: s.email, metric: "active" }); }}><b className="asb-active">{s.active}</b> <span className="asb-sq-pct">({pct(s.active, s.total)})</span></div>
                 <div className="asb-sq-num" onClick={(e) => { e.stopPropagation(); setClaimedByF(s.email); setDrill({ by: s.email, metric: "notouch" }); }}>{s.noTouch} <span className="asb-sq-pct">({pct(s.noTouch, s.total)})</span></div>
@@ -1238,6 +1249,9 @@ const CSS = `
 .asb-sq-th:hover{background:#fafbfc;}
 .asb-sq-name{display:flex;align-items:center;gap:8px;font-weight:560;}
 .asb-sq-name .asb-av{width:22px;height:22px;border-radius:50%;background:var(--slate);color:#fff;font-size:9.5px;font-weight:680;display:inline-flex;align-items:center;justify-content:center;}
+.asb-sq-release{margin-left:auto;opacity:0;background:#fff;border:1px solid var(--line);border-radius:6px;padding:3px 8px;font:inherit;font-size:10.5px;color:var(--slate);cursor:pointer;transition:opacity .12s;}
+.asb-sq-row:hover .asb-sq-release{opacity:1;}
+.asb-sq-release:hover{border-color:var(--red);color:var(--red);}
 .asb-sq-row.on .asb-sq-name .asb-av{background:var(--indigo);}
 .asb-sq-row b{font-family:ui-monospace,Menlo,monospace;}
 .asb-sq-pct{color:var(--muted);font-size:11px;}
